@@ -3,7 +3,7 @@ from typing import Optional, List, Dict, Any
 
 
 class SendRequest(BaseModel):
-    sim_id: int
+    sim_id: str   # 🔥 CHANGED
     phone: str
     message: str
     meta: Optional[Dict[str, Any]] = None
@@ -23,7 +23,7 @@ class HealthResponse(BaseModel):
 
 
 class ModemHealthItem(BaseModel):
-    sim_id: Optional[int] = None
+    sim_id: Optional[str] = None   # 🔥 CHANGED
     port: str
     reachable: bool
     at_ok: bool
