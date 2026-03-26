@@ -92,22 +92,22 @@ def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> 
     device_ids = sorted(glob.glob("/dev/serial/by-id/*"))
 
     for device_id in device_ids:
+        # Quectel EC25: use only interface 01 as AT/SMS port.
+        if "if01" not in device_id:
+            continue
+
         try:
             port = os.path.realpath(device_id)
         except Exception:
             port = device_id
 
+        # Guard against malformed device paths and enforce ttyUSB usage.
+        if port.startswith("/ev/ttyUSB"):
+            port = port.replace("/ev/ttyUSB", "/dev/ttyUSB", 1)
+        if not port.startswith("/dev/ttyUSB"):
+            continue
+
         if not os.path.exists(port):
-            modems.append(
-                {
-                    "sim_id": _stable_sim_id(device_id),
-                    "device_id": device_id,
-                    "port": port,
-                    "at_ok": False,
-                    "sim_ready": False,
-                    "signal": None,
-                }
-            )
             continue
 
         try:
@@ -117,17 +117,10 @@ def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> 
                 serial_timeout=serial_timeout,
                 command_timeout=command_timeout,
             )
-            modems.append(modem)
-        except Exception:
-            modems.append(
-                {
-                    "sim_id": _stable_sim_id(device_id),
-                    "device_id": device_id,
-                    "port": port,
-                    "at_ok": False,
-                    "sim_ready": False,
-                    "signal": None,
-                }
-            )
+            if modem.get("at_ok"):
+                modems.append(modem)
+        except Exception as e:
+            print(f"[MODEM ERROR] {device_id} → {str(e)}")
+            continue
 
     return modems
