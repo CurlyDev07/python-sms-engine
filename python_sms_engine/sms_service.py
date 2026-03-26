@@ -3,6 +3,7 @@ import time
 from typing import Any, Dict, Optional
 
 from at_client import ModemATClient, SMSExecutionError
+from modem_registry import ModemRegistry
 from schemas import SendResponse
 
 logger = logging.getLogger("python_sms_engine")
@@ -22,23 +23,24 @@ def _truncate_raw(value: Optional[str]) -> Optional[str]:
 class SmsService:
     def __init__(
         self,
-        sim_map: Dict[int, str],
+        registry: ModemRegistry,
         serial_timeout: float,
         command_timeout: float,
         send_timeout: float,
     ) -> None:
-        self.sim_map = sim_map
+        self.registry = registry
         self.serial_timeout = serial_timeout
         self.command_timeout = command_timeout
         self.send_timeout = send_timeout
 
-    def update_sim_map(self, sim_map: Dict[int, str]) -> None:
-        self.sim_map = sim_map
-
     def _port_for_sim(self, sim_id: int) -> str:
-        if sim_id not in self.sim_map:
-            raise SMSExecutionError("SIM_NOT_MAPPED")
-        return self.sim_map[sim_id]
+        modem = self.registry.get_by_sim_id(sim_id=sim_id)
+        if modem and modem.get("at_ok"):
+            port = modem.get("port")
+            if isinstance(port, str) and port:
+                return port
+
+        raise SMSExecutionError("SIM_NOT_MAPPED")
 
     def send(
         self,
@@ -77,7 +79,6 @@ class SmsService:
             )
 
             duration_ms = int((time.monotonic() - started_at) * 1000)
-
             merged_raw = _truncate_raw("\n".join(v for v in raw_steps.values() if v))
 
             logger.info(

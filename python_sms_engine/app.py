@@ -1,38 +1,38 @@
-from fastapi import FastAPI
-from schemas import (
-    SendRequest,
-    SendResponse,
-    HealthResponse,
-    ModemsHealthResponse,
-)
-from sms_service import SmsService
-from modem_manager import ModemManager
-from config import settings, load_sim_map_safe
-from modem_detector import detect_modems
-
 import logging
 
+from fastapi import FastAPI
+
+from config import settings
+from modem_manager import ModemManager
+from modem_registry import ModemRegistry
+from schemas import HealthResponse, ModemsHealthResponse, SendRequest, SendResponse
+from sms_service import SmsService
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
 logger = logging.getLogger("python_sms_engine")
+app = FastAPI(title="python_sms_engine")
 
-app = FastAPI()
-
+app.state.modem_registry = ModemRegistry(
+    serial_timeout=settings.serial_timeout,
+    command_timeout=settings.command_timeout,
+)
 
 app.state.sms_service = SmsService(
-    sim_map=sim_map,
+    registry=app.state.modem_registry,
     serial_timeout=settings.serial_timeout,
     command_timeout=settings.command_timeout,
     send_timeout=settings.send_timeout,
 )
 
 app.state.modem_manager = ModemManager(
-    sim_map=sim_map,
-    serial_timeout=settings.serial_timeout,
-    command_timeout=settings.command_timeout,
+    registry=app.state.modem_registry,
 )
 
-# -----------------------------
-# SEND SMS
-# -----------------------------
+
 @app.post("/send", response_model=SendResponse)
 def send_sms(request: SendRequest) -> SendResponse:
     service: SmsService = app.state.sms_service
@@ -44,59 +44,24 @@ def send_sms(request: SendRequest) -> SendResponse:
     )
 
 
-# -----------------------------
-# HEALTH CHECK
-# -----------------------------
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    return HealthResponse(
-        success=True,
-        service="python_sms_engine",
-        status="ok"
-    )
+    return HealthResponse(success=True, service="python_sms_engine", status="ok")
 
 
-# -----------------------------
-# EXISTING MODEM HEALTH (STATIC MAP)
-# -----------------------------
 @app.get("/modems/health", response_model=ModemsHealthResponse)
 def modems_health() -> ModemsHealthResponse:
-    sim_map, error = load_sim_map_safe(settings.sim_map_file)
     manager: ModemManager = app.state.modem_manager
-
-    if error:
-        logger.error(
-            "SIM_MAP_LOAD_FAILED file=%s error=%s",
-            settings.sim_map_file,
-            error
-        )
-    else:
-        manager.update_sim_map(sim_map)
-
-    return ModemsHealthResponse(
-        success=True,
-        modems=manager.health()
-    )
+    return ModemsHealthResponse(success=True, modems=manager.health())
 
 
-# -----------------------------
-# 🔥 NEW: AUTO MODEM DISCOVERY (SaaS LEVEL)
-# -----------------------------
 @app.get("/modems/discover")
-def discover_modems():
+def discover_modems() -> dict:
     try:
-        modems = detect_modems()
-
-        return {
-            "success": True,
-            "modems": modems
-        }
-
-    except Exception as e:
-        logger.error("MODEM_DISCOVERY_FAILED error=%s", str(e))
-
-        return {
-            "success": False,
-            "error": str(e),
-            "modems": []
-        }
+        registry: ModemRegistry = app.state.modem_registry
+        registry.refresh()
+        modems = registry.get_all()
+        return {"success": True, "modems": modems}
+    except Exception:
+        logger.exception("MODEM_DISCOVERY_FAILED")
+        return {"success": False, "error": "DISCOVERY_FAILED", "modems": []}

@@ -1,46 +1,28 @@
 import logging
 import time
-from typing import Dict, List
+from typing import List
 
-from at_client import ModemATClient
+from modem_registry import ModemRegistry
 from schemas import ModemHealthItem
 
 logger = logging.getLogger("python_sms_engine")
 
 
 class ModemManager:
-    def __init__(self, sim_map: Dict[int, str], serial_timeout: float, command_timeout: float) -> None:
-        self.sim_map = sim_map
-        self.serial_timeout = serial_timeout
-        self.command_timeout = command_timeout
-
-    def update_sim_map(self, sim_map: Dict[int, str]) -> None:
-        self.sim_map = sim_map
+    def __init__(self, registry: ModemRegistry) -> None:
+        self.registry = registry
 
     def health(self) -> List[ModemHealthItem]:
         results: List[ModemHealthItem] = []
+        modems = self.registry.get_all()
 
-        for sim_id, port in self.sim_map.items():
+        for modem in modems:
             started_at = time.monotonic()
-            reachable = False
-            at_ok = False
-            error = None
-
-            try:
-                client = ModemATClient(
-                    port=port,
-                    serial_timeout=self.serial_timeout,
-                    command_timeout=self.command_timeout,
-                )
-                probe = client.probe(timeout=self.command_timeout)
-                reachable = probe["reachable"]
-                at_ok = probe["at_ok"]
-                if not at_ok:
-                    error = "AT_NOT_RESPONDING"
-            except Exception:
-                reachable = False
-                at_ok = False
-                error = "CHECK_FAILED"
+            sim_id = modem.get("sim_id")
+            port = str(modem.get("port") or "")
+            at_ok = bool(modem.get("at_ok"))
+            reachable = bool(port)
+            error = None if at_ok else "AT_NOT_RESPONDING"
 
             duration_ms = int((time.monotonic() - started_at) * 1000)
             logger.info(
@@ -51,6 +33,14 @@ class ModemManager:
                 duration_ms,
                 error,
             )
-            results.append(ModemHealthItem(sim_id=sim_id, port=port, reachable=reachable, at_ok=at_ok))
+
+            results.append(
+                ModemHealthItem(
+                    sim_id=sim_id,
+                    port=port,
+                    reachable=reachable,
+                    at_ok=at_ok,
+                )
+            )
 
         return results
