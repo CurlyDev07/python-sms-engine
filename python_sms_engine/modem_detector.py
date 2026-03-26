@@ -26,6 +26,7 @@ def _extract_signal(raw: str) -> Optional[str]:
 def _probe_modem(device_id: str, port: str, serial_timeout: float, command_timeout: float) -> Dict[str, Any]:
     at_ok = False
     sim_ready = False
+    creg_registered = False
     signal: Optional[str] = None
 
     client = ModemATClient(
@@ -84,6 +85,21 @@ def _probe_modem(device_id: str, port: str, serial_timeout: float, command_timeo
 
             if not sim_ready and signal:
                 sim_ready = True
+
+            try:
+                creg_response = client._command_expect_ok(
+                    "AT+CREG?",
+                    "AT_NOT_RESPONDING",
+                    deadline=time.monotonic() + command_timeout,
+                    retries=0,
+                )
+                print(f"[CREG RESPONSE] {device_id} → {creg_response}")
+
+                if "0,1" in creg_response or "0,5" in creg_response:
+                    creg_registered = True
+
+            except Exception:
+                creg_registered = False
     finally:
         if opened:
             client.close()
@@ -94,6 +110,7 @@ def _probe_modem(device_id: str, port: str, serial_timeout: float, command_timeo
         "port": port,
         "at_ok": at_ok,
         "sim_ready": sim_ready,
+        "creg_registered": creg_registered,
         "signal": signal,
     }
 
@@ -142,11 +159,23 @@ def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> 
         if not candidates:
             continue
 
+        candidates = [m for m in candidates if m.get("creg_registered")]
+
+        if not candidates:
+            continue
+
         def _score(item: Dict[str, Any]) -> tuple:
-            has_signal = bool(item.get("signal"))
+            creg = bool(item.get("creg_registered"))
             sim_ready = bool(item.get("sim_ready"))
+            signal = bool(item.get("signal"))
             at_ok = bool(item.get("at_ok"))
-            return (1 if sim_ready and has_signal else 0, 1 if sim_ready else 0, 1 if at_ok else 0)
+
+            return (
+                1 if creg else 0,
+                1 if sim_ready else 0,
+                1 if signal else 0,
+                1 if at_ok else 0,
+            )
 
         best = max(candidates, key=_score)
         modems.append(best)
