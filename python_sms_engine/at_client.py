@@ -195,132 +195,132 @@ class ModemATClient:
         return {"reachable": reachable, "at_ok": at_ok}
 
     def send_sms(self, phone: str, message: str, global_timeout: float) -> Dict[str, str]:
-    deadline = time.monotonic() + global_timeout
+        deadline = time.monotonic() + global_timeout
 
-    responses: Dict[str, str] = {
-        "at": "",
-        "ate0": "",
-        "cmgf": "",
-        "cmgs_prompt": "",
-        "final": "",
-    }
+        responses: Dict[str, str] = {
+            "at": "",
+            "ate0": "",
+            "cmgf": "",
+            "cmgs_prompt": "",
+            "final": "",
+        }
 
-    opened = False
+        opened = False
 
-    try:
-        print(f"[SEND START] port={self.port}")
+        try:
+            print(f"[SEND START] port={self.port}")
 
-        self.open()
-        opened = True
-
-        if self._serial:
-            self._serial.write(b"\r\r\r")
-            time.sleep(0.2)
-            self._serial.reset_input_buffer()
-
-        # AT CHECK
-        for _ in range(3):
-            try:
-                responses["at"] = self._command_expect_ok(
-                    "AT",
-                    "AT_NOT_RESPONDING",
-                    deadline=deadline,
-                    retries=0,
-                )
-                if "OK" in responses["at"]:
-                    break
-            except Exception:
-                time.sleep(0.3)
-        else:
-            raise SMSExecutionError("AT_NOT_RESPONDING")
-
-        print("[STEP] AT OK")
-        time.sleep(0.1)
-
-        # DISABLE ECHO
-        responses["ate0"] = self._command_expect_ok(
-            "ATE0",
-            "AT_NOT_RESPONDING",
-            deadline=deadline,
-            retries=0,
-        )
-        time.sleep(0.1)
-
-        # TEXT MODE
-        responses["cmgf"] = self._command_expect_ok(
-            "AT+CMGF=1",
-            "CMGF_FAILED",
-            deadline=deadline,
-            retries=1,
-        )
-        print("[STEP] CMGF OK")
-        time.sleep(0.1)
-
-        # START SEND
-        self._write(
-            f'AT+CMGS="{phone}"\r'.encode("utf-8"),
-            timeout_code="CMGS_PROMPT_FAILED",
-            raw=responses["cmgf"],
-        )
-
-        responses["cmgs_prompt"] = self._read_until(
-            expected=[">"],
-            failure=["ERROR", "+CMS ERROR", "+CME ERROR"],
-            timeout=self._step_timeout(deadline),
-            timeout_code="CMGS_PROMPT_FAILED",
-        )
-
-        if ">" not in responses["cmgs_prompt"]:
-            raise SMSExecutionError("CMGS_PROMPT_FAILED", raw=responses["cmgs_prompt"])
-
-        # SEND MESSAGE
-        payload = message.encode("utf-8", errors="ignore") + bytes([26])
-        self._write(payload, timeout_code="SEND_FAILED", raw=responses["cmgs_prompt"])
-
-        print("[STEP] CMGS SENT")
-
-        # WAIT FOR NETWORK
-        time.sleep(1.5)
-
-        # 🔥 FULL RESPONSE READ (FINAL FIX)
-        final_buffer = ""
-        start_time = time.monotonic()
-
-        while True:
-            if time.monotonic() - start_time > max(5, self._step_timeout(deadline)):
-                break
+            self.open()
+            opened = True
 
             if self._serial:
+                self._serial.write(b"\r\r\r")
+                time.sleep(0.2)
+                self._serial.reset_input_buffer()
+
+            # AT CHECK
+            for _ in range(3):
                 try:
-                    chunk = self._serial.read_all().decode("utf-8", errors="ignore")
-                    if chunk:
-                        final_buffer += chunk
-                        print(f"[READ CHUNK] {chunk}")
+                    responses["at"] = self._command_expect_ok(
+                        "AT",
+                        "AT_NOT_RESPONDING",
+                        deadline=deadline,
+                        retries=0,
+                    )
+                    if "OK" in responses["at"]:
+                        break
                 except Exception:
-                    pass
+                    time.sleep(0.3)
+            else:
+                raise SMSExecutionError("AT_NOT_RESPONDING")
 
-            time.sleep(0.2)
+            print("[STEP] AT OK")
+            time.sleep(0.1)
 
-        responses["final"] = final_buffer.strip()
+            # DISABLE ECHO
+            responses["ate0"] = self._command_expect_ok(
+                "ATE0",
+                "AT_NOT_RESPONDING",
+                deadline=deadline,
+                retries=0,
+            )
+            time.sleep(0.1)
 
-        self._parse_final_response(responses["final"])
+            # TEXT MODE
+            responses["cmgf"] = self._command_expect_ok(
+                "AT+CMGF=1",
+                "CMGF_FAILED",
+                deadline=deadline,
+                retries=1,
+            )
+            print("[STEP] CMGF OK")
+            time.sleep(0.1)
 
-        return responses
+            # START SEND
+            self._write(
+                f'AT+CMGS="{phone}"\r'.encode("utf-8"),
+                timeout_code="CMGS_PROMPT_FAILED",
+                raw=responses["cmgf"],
+            )
 
-    except SMSExecutionError as exc:
-        raw_parts = [
-            responses.get("at", ""),
-            responses.get("ate0", ""),
-            responses.get("cmgf", ""),
-            responses.get("cmgs_prompt", ""),
-            responses.get("final", ""),
-            exc.raw or "",
-        ]
+            responses["cmgs_prompt"] = self._read_until(
+                expected=[">"],
+                failure=["ERROR", "+CMS ERROR", "+CME ERROR"],
+                timeout=self._step_timeout(deadline),
+                timeout_code="CMGS_PROMPT_FAILED",
+            )
 
-        merged_raw = "\n".join(part for part in raw_parts if part)
+            if ">" not in responses["cmgs_prompt"]:
+                raise SMSExecutionError("CMGS_PROMPT_FAILED", raw=responses["cmgs_prompt"])
 
-        raise SMSExecutionError(exc.code, raw=merged_raw or None) from exc
+            # SEND MESSAGE
+            payload = message.encode("utf-8", errors="ignore") + bytes([26])
+            self._write(payload, timeout_code="SEND_FAILED", raw=responses["cmgs_prompt"])
 
-    finally:
-        if opened:
-            self.close()
+            print("[STEP] CMGS SENT")
+
+            # WAIT FOR NETWORK
+            time.sleep(1.5)
+
+            # 🔥 FULL RESPONSE READ (FINAL FIX)
+            final_buffer = ""
+            start_time = time.monotonic()
+
+            while True:
+                if time.monotonic() - start_time > max(5, self._step_timeout(deadline)):
+                    break
+
+                if self._serial:
+                    try:
+                        chunk = self._serial.read_all().decode("utf-8", errors="ignore")
+                        if chunk:
+                            final_buffer += chunk
+                            print(f"[READ CHUNK] {chunk}")
+                    except Exception:
+                        pass
+
+                time.sleep(0.2)
+
+            responses["final"] = final_buffer.strip()
+
+            self._parse_final_response(responses["final"])
+
+            return responses
+
+        except SMSExecutionError as exc:
+            raw_parts = [
+                responses.get("at", ""),
+                responses.get("ate0", ""),
+                responses.get("cmgf", ""),
+                responses.get("cmgs_prompt", ""),
+                responses.get("final", ""),
+                exc.raw or "",
+            ]
+
+            merged_raw = "\n".join(part for part in raw_parts if part)
+
+            raise SMSExecutionError(exc.code, raw=merged_raw or None) from exc
+
+        finally:
+            if opened:
+                self.close()
