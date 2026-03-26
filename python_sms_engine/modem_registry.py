@@ -3,24 +3,16 @@ from typing import Any, Dict, List, Optional
 
 from modem_detector import detect_modems
 
-MODEM_REGISTRY_TTL_SECONDS = 10.0
-
 
 class ModemRegistry:
-    def __init__(
-        self,
-        serial_timeout: float,
-        command_timeout: float,
-        ttl_seconds: float = MODEM_REGISTRY_TTL_SECONDS,
-    ) -> None:
+    def __init__(self, serial_timeout: float, command_timeout: float):
         self.serial_timeout = serial_timeout
         self.command_timeout = command_timeout
-        self.ttl = ttl_seconds
-
         self._cache: List[Dict[str, Any]] = []
         self._last_refresh: float = 0.0
 
     def refresh(self) -> List[Dict[str, Any]]:
+        print("[REGISTRY] Refreshing modems...")
         self._cache = detect_modems(
             serial_timeout=self.serial_timeout,
             command_timeout=self.command_timeout,
@@ -28,22 +20,14 @@ class ModemRegistry:
         self._last_refresh = time.monotonic()
         return self._cache
 
-    def _is_expired(self) -> bool:
-        if not self._cache:
-            return True
-        return (time.monotonic() - self._last_refresh) >= self.ttl
-
     def get_all(self) -> List[Dict[str, Any]]:
-        if self._is_expired():
-            return self.refresh()
         return self._cache
 
     def get_by_sim_id(self, sim_id: int) -> Optional[Dict[str, Any]]:
-        # 🔥 STRICT CACHE ONLY (NO SCAN)
         for modem in self._cache:
             if modem.get("sim_id") == sim_id:
-                print(f"[REGISTRY HIT] sim_id={sim_id} → {modem.get('port')}")
+                print(f"[REGISTRY HIT] {sim_id} → {modem.get('port')}")
                 return modem
 
-        print(f"[REGISTRY ERROR] sim_id={sim_id} NOT FOUND IN CACHE")
+        print(f"[REGISTRY MISS] {sim_id}")
         return None

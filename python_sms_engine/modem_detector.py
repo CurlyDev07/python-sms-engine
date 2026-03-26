@@ -1,16 +1,9 @@
 import glob
-import hashlib
 import os
 import time
 from typing import Any, Dict, List, Optional
 
 from at_client import ModemATClient
-
-
-def _stable_sim_id(device_id: str) -> int:
-    # Deterministic integer derived from stable /dev/serial/by-id path.
-    digest = hashlib.sha1(device_id.encode("utf-8")).hexdigest()[:8]
-    return int(digest, 16)
 
 
 def _extract_signal(raw: str) -> Optional[str]:
@@ -23,90 +16,93 @@ def _extract_signal(raw: str) -> Optional[str]:
     return None
 
 
-def _probe_modem(device_id: str, port: str, serial_timeout: float, command_timeout: float) -> Dict[str, Any]:
-    at_ok = False
-    sim_ready = False
-    creg_registered = False
-    signal: Optional[str] = None
+def _is_registered(creg_response: str) -> bool:
+    if not creg_response:
+        return False
+    return "+CREG: 0,1" in creg_response or "+CREG: 0,5" in creg_response
 
+
+def _probe_modem(port: str, serial_timeout: float, command_timeout: float) -> Dict[str, Any]:
     client = ModemATClient(
         port=port,
         serial_timeout=serial_timeout,
         command_timeout=command_timeout,
     )
 
+    at_ok = False
+    sim_ready = False
+    creg_registered = False
+    signal: Optional[str] = None
+
     opened = False
+
     try:
         client.open()
         opened = True
 
+        # AT
         try:
-            at_response = client._command_expect_ok(
+            at_resp = client._command_expect_ok(
                 "AT",
                 "AT_NOT_RESPONDING",
                 deadline=time.monotonic() + command_timeout,
                 retries=0,
             )
-            print(f"[AT RESPONSE] {device_id} → {at_response}")
-            if at_response and "OK" in at_response:
-                at_ok = True
-            else:
-                at_ok = False
+            at_ok = "OK" in at_resp
         except Exception:
             at_ok = False
 
-        if at_ok:
-            try:
-                cpin_response = client._command_expect_ok(
-                    "AT+CPIN?",
-                    "AT_NOT_RESPONDING",
-                    deadline=time.monotonic() + command_timeout,
-                    retries=0,
-                )
-                print(f"[CPIN RESPONSE] {device_id} → {cpin_response}")
-                if cpin_response and "READY" in cpin_response:
-                    sim_ready = True
-                else:
-                    sim_ready = False
-            except Exception:
-                sim_ready = False
+        if not at_ok:
+            return {
+                "port": port,
+                "at_ok": False,
+                "sim_ready": False,
+                "creg_registered": False,
+                "signal": None,
+            }
 
-            try:
-                client._write(b"AT+CSQ\r", timeout_code="AT_NOT_RESPONDING")
-                csq_response = client._read_until(
-                    expected=["+CSQ:", "OK"],
-                    failure=["ERROR", "+CMS ERROR", "+CME ERROR"],
-                    timeout=command_timeout,
-                    timeout_code="AT_NOT_RESPONDING",
-                )
-                signal = _extract_signal(csq_response)
-            except Exception:
-                signal = None
+        # CPIN
+        try:
+            cpin = client._command_expect_ok(
+                "AT+CPIN?",
+                "AT_NOT_RESPONDING",
+                deadline=time.monotonic() + command_timeout,
+                retries=0,
+            )
+            sim_ready = "READY" in cpin
+        except Exception:
+            sim_ready = False
 
-            if not sim_ready and signal:
-                sim_ready = True
+        # CREG
+        try:
+            creg = client._command_expect_ok(
+                "AT+CREG?",
+                "AT_NOT_RESPONDING",
+                deadline=time.monotonic() + command_timeout,
+                retries=0,
+            )
+            creg_registered = _is_registered(creg)
+        except Exception:
+            creg_registered = False
 
-            try:
-                creg_response = client._command_expect_ok(
-                    "AT+CREG?",
-                    "AT_NOT_RESPONDING",
-                    deadline=time.monotonic() + command_timeout,
-                    retries=0,
-                )
-                print(f"[CREG RESPONSE] {device_id} → {creg_response}")
+        # SIGNAL
+        try:
+            client._write(b"AT+CSQ\r", timeout_code="AT_NOT_RESPONDING")
+            csq = client._read_until(
+                expected=["+CSQ:", "OK"],
+                failure=["ERROR"],
+                timeout=command_timeout,
+                timeout_code="AT_NOT_RESPONDING",
+            )
+            signal = _extract_signal(csq)
+        except Exception:
+            signal = None
 
-                if "0,1" in creg_response or "0,5" in creg_response:
-                    creg_registered = True
-
-            except Exception:
-                creg_registered = False
     finally:
         if opened:
             client.close()
 
     return {
-        "sim_id": _stable_sim_id(device_id),
-        "device_id": device_id,
         "port": port,
         "at_ok": at_ok,
         "sim_ready": sim_ready,
@@ -118,36 +114,64 @@ def _probe_modem(device_id: str, port: str, serial_timeout: float, command_timeo
 def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> List[Dict[str, Any]]:
     modems: List[Dict[str, Any]] = []
 
-    # 🔥 SCAN REAL USB PORTS (FIX)
-    ports = sorted(glob.glob("/dev/ttyUSB*"))
+    device_ids = sorted(glob.glob("/dev/serial/by-id/*"))
 
-    print(f"[DETECT] Found ports: {ports}")
+    grouped: Dict[str, List[str]] = {}
 
-    for port in ports:
-        if not os.path.exists(port):
-            continue
+    # 🔥 GROUP PER PHYSICAL MODEM
+    for dev in device_ids:
+        base = os.path.basename(dev)
+        physical = base.split("-if", 1)[0]
+        grouped.setdefault(physical, []).append(dev)
 
-        device_id = port  # use port as identifier
+    for physical_id, devs in grouped.items():
 
-        try:
-            modem = _probe_modem(
-                device_id=device_id,
-                port=port,
-                serial_timeout=serial_timeout,
-                command_timeout=command_timeout,
-            )
+        # 🔥 PRIORITY ORDER
+        priority_order = ["if02", "if01", "if00", "if03"]
 
-            print(f"[PROBE RESULT] {port} → {modem}")
+        sorted_devs = sorted(
+            devs,
+            key=lambda d: next((i for i, p in enumerate(priority_order) if p in d), 99)
+        )
 
-            # ✅ ONLY ACCEPT NETWORK-REGISTERED MODEM
-            if modem.get("creg_registered"):
-                print(f"[MODEM ACCEPTED] {port}")
-                modems.append(modem)
-            else:
-                print(f"[MODEM REJECTED] {port} (NOT REGISTERED)")
+        print(f"[GROUP] {physical_id} → {sorted_devs}")
 
-        except Exception as e:
-            print(f"[MODEM ERROR] {port} → {str(e)}")
-            continue
+        # 🔥 TRY ONE BY ONE, STOP ON FIRST SUCCESS
+        for dev in sorted_devs:
+            try:
+                port = os.path.realpath(dev)
+
+                if not port.startswith("/dev/ttyUSB"):
+                    continue
+
+                if not os.path.exists(port):
+                    continue
+
+                result = _probe_modem(
+                    port=port,
+                    serial_timeout=serial_timeout,
+                    command_timeout=command_timeout,
+                )
+
+                print(f"[TRY] {port} → {result}")
+
+                if result["creg_registered"]:
+                    print(f"[SELECTED] {port} ✅")
+
+                    modems.append({
+                        "sim_id": hash(port) & 0xFFFFFFFF,
+                        "device_id": dev,
+                        "port": port,
+                        "at_ok": result["at_ok"],
+                        "sim_ready": result["sim_ready"],
+                        "creg_registered": result["creg_registered"],
+                        "signal": result["signal"],
+                    })
+
+                    break  # 🔥 CRITICAL: STOP HERE
+
+            except Exception as e:
+                print(f"[ERROR] {dev} → {str(e)}")
+                continue
 
     return modems
