@@ -13,6 +13,7 @@ class Settings:
         self.host = os.getenv("SMS_ENGINE_HOST", "0.0.0.0")
         self.port = int(os.getenv("SMS_ENGINE_PORT", "8000"))
 
+settings = Settings()
 
 def load_sim_map(path: str) -> Dict[int, str]:
     map_file = Path(path)

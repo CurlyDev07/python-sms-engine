@@ -1,34 +1,19 @@
-from typing import Any, Dict, List, Optional
-
-from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
 
 
 class SendRequest(BaseModel):
-    sim_id: StrictInt
-    phone: StrictStr
-    message: StrictStr
-    meta: Dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("phone")
-    @classmethod
-    def validate_phone(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("phone must not be empty")
-        return value
-
-    @field_validator("message")
-    @classmethod
-    def validate_message(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("message must not be empty")
-        return value
+    sim_id: int
+    phone: str
+    message: str
+    meta: Optional[Dict[str, Any]] = None
 
 
-class SmsSendResult(BaseModel):
+class SendResponse(BaseModel):
     success: bool
-    message_id: Optional[int] = None
+    message_id: Optional[str] = None
     error: Optional[str] = None
-    raw: Dict[str, Any] = Field(default_factory=dict)
+    raw: Optional[Dict[str, Any]] = None
 
 
 class HealthResponse(BaseModel):
@@ -38,7 +23,7 @@ class HealthResponse(BaseModel):
 
 
 class ModemHealthItem(BaseModel):
-    sim_id: int
+    sim_id: Optional[int] = None
     port: str
     reachable: bool
     at_ok: bool

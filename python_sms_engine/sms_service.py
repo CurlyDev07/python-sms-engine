@@ -3,7 +3,7 @@ import time
 from typing import Any, Dict, Optional
 
 from at_client import ModemATClient, SMSExecutionError
-from schemas import SmsSendResult
+from schemas import SendResponse
 
 logger = logging.getLogger("python_sms_engine")
 
@@ -19,7 +19,7 @@ def _truncate_raw(value: Optional[str]) -> Optional[str]:
     return f"{text[:RAW_MAX_LEN]}...<truncated>"
 
 
-class SMSService:
+class SmsService:
     def __init__(
         self,
         sim_map: Dict[int, str],
@@ -40,13 +40,21 @@ class SMSService:
             raise SMSExecutionError("SIM_NOT_MAPPED")
         return self.sim_map[sim_id]
 
-    def send(self, sim_id: int, phone: str, message: str, meta: Optional[Dict[str, Any]] = None) -> SmsSendResult:
+    def send(
+        self,
+        sim_id: int,
+        phone: str,
+        message: str,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> SendResponse:
+
         del meta
         port: Optional[str] = None
         started_at = time.monotonic()
 
         try:
             port = self._port_for_sim(sim_id)
+
             logger.info(
                 "SMS_SEND_ATTEMPT sim_id=%s port=%s phone=%s duration_ms=%s error=%s",
                 sim_id,
@@ -61,10 +69,17 @@ class SMSService:
                 serial_timeout=self.serial_timeout,
                 command_timeout=self.command_timeout,
             )
-            raw_steps = client.send_sms(phone=phone, message=message, global_timeout=self.send_timeout)
+
+            raw_steps = client.send_sms(
+                phone=phone,
+                message=message,
+                global_timeout=self.send_timeout,
+            )
+
             duration_ms = int((time.monotonic() - started_at) * 1000)
 
             merged_raw = _truncate_raw("\n".join(v for v in raw_steps.values() if v))
+
             logger.info(
                 "SMS_SEND_SUCCESS sim_id=%s port=%s phone=%s duration_ms=%s error=%s",
                 sim_id,
@@ -73,7 +88,8 @@ class SMSService:
                 duration_ms,
                 None,
             )
-            return SmsSendResult(
+
+            return SendResponse(
                 success=True,
                 message_id=None,
                 error=None,
@@ -84,8 +100,10 @@ class SMSService:
                     "modem_response": merged_raw,
                 },
             )
+
         except SMSExecutionError as exc:
             duration_ms = int((time.monotonic() - started_at) * 1000)
+
             logger.error(
                 "SMS_SEND_FAILED sim_id=%s port=%s phone=%s duration_ms=%s error=%s",
                 sim_id,
@@ -94,7 +112,8 @@ class SMSService:
                 duration_ms,
                 exc.code,
             )
-            return SmsSendResult(
+
+            return SendResponse(
                 success=False,
                 message_id=None,
                 error=exc.code,
@@ -104,8 +123,10 @@ class SMSService:
                     "modem_response": _truncate_raw(exc.raw),
                 },
             )
+
         except Exception:
             duration_ms = int((time.monotonic() - started_at) * 1000)
+
             logger.exception(
                 "SMS_SEND_FAILED sim_id=%s port=%s phone=%s duration_ms=%s error=%s",
                 sim_id,
@@ -114,7 +135,8 @@ class SMSService:
                 duration_ms,
                 "UNKNOWN_ERROR",
             )
-            return SmsSendResult(
+
+            return SendResponse(
                 success=False,
                 message_id=None,
                 error="UNKNOWN_ERROR",
