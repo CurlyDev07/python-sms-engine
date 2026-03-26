@@ -62,7 +62,11 @@ def _probe_modem(device_id: str, port: str, serial_timeout: float, command_timeo
                     deadline=time.monotonic() + command_timeout,
                     retries=0,
                 )
-                sim_ready = "READY" in cpin_response
+                print(f"[CPIN RESPONSE] {device_id} → {cpin_response}")
+                if cpin_response and "READY" in cpin_response:
+                    sim_ready = True
+                else:
+                    sim_ready = False
             except Exception:
                 sim_ready = False
 
@@ -77,6 +81,9 @@ def _probe_modem(device_id: str, port: str, serial_timeout: float, command_timeo
                 signal = _extract_signal(csq_response)
             except Exception:
                 signal = None
+
+            if not sim_ready and signal:
+                sim_ready = True
     finally:
         if opened:
             client.close()
