@@ -83,7 +83,7 @@ def _query_ok_response(
     )
 
 
-def _query_sms_capable(client: ModemATClient, command_timeout: float) -> Tuple[bool, Optional[str]]:
+def _query_cpms(client: ModemATClient, command_timeout: float) -> Tuple[bool, Optional[str]]:
     try:
         resp = _query_ok_response(
             client,
@@ -91,9 +91,7 @@ def _query_sms_capable(client: ModemATClient, command_timeout: float) -> Tuple[b
             "AT_NOT_RESPONDING",
             command_timeout,
         )
-        if "+CPMS:" in resp:
-            return True, resp
-        return False, resp
+        return "+CPMS:" in resp, resp
     except Exception:
         return False, None
 
@@ -106,14 +104,12 @@ def _query_identity(client: ModemATClient, command_timeout: float) -> Dict[str, 
         "msisdn": None,
     }
 
-    # IMSI (best primary SIM identity)
     try:
         resp = _query_ok_response(client, "AT+CIMI", "AT_NOT_RESPONDING", command_timeout)
         identity["imsi"] = _extract_first_meaningful_line(resp)
     except Exception:
         pass
 
-    # ICCID
     try:
         resp = _query_ok_response(client, "AT+CCID", "AT_NOT_RESPONDING", command_timeout)
         line = _extract_first_meaningful_line(resp)
@@ -122,14 +118,12 @@ def _query_identity(client: ModemATClient, command_timeout: float) -> Dict[str, 
     except Exception:
         pass
 
-    # IMEI
     try:
         resp = _query_ok_response(client, "AT+GSN", "AT_NOT_RESPONDING", command_timeout)
         identity["imei"] = _extract_first_meaningful_line(resp)
     except Exception:
         pass
 
-    # Optional only, not reliable as primary identity
     try:
         resp = _query_ok_response(client, "AT+CNUM", "AT_NOT_RESPONDING", command_timeout)
         identity["msisdn"] = _extract_first_meaningful_line(resp)
@@ -175,7 +169,6 @@ def _probe_modem(
         client.open()
         opened = True
 
-        # Wake modem and stabilize
         try:
             client._write(b"\r\r\r", timeout_code="AT_NOT_RESPONDING")
             time.sleep(0.15)
@@ -184,7 +177,6 @@ def _probe_modem(
         except Exception:
             pass
 
-        # AT
         try:
             at_resp = _query_ok_response(client, "AT", "AT_NOT_RESPONDING", command_timeout)
             result["at_ok"] = "OK" in at_resp
@@ -194,35 +186,27 @@ def _probe_modem(
         if not result["at_ok"]:
             return result
 
-        # Disable echo for cleaner parsing
         try:
             _query_ok_response(client, "ATE0", "AT_NOT_RESPONDING", command_timeout)
         except Exception:
             pass
 
-        # Real SMS capability fingerprint
-        sms_capable, cpms_resp = _query_sms_capable(client, command_timeout)
-        result["sms_capable"] = sms_capable
+        cpms_ok, cpms_resp = _query_cpms(client, command_timeout)
+        result["sms_capable"] = cpms_ok
         result["cpms"] = cpms_resp
 
-        if not sms_capable:
-            return result
-
-        # CPIN
         try:
             cpin = _query_ok_response(client, "AT+CPIN?", "AT_NOT_RESPONDING", command_timeout)
             result["sim_ready"] = "READY" in cpin
         except Exception:
             result["sim_ready"] = False
 
-        # CREG
         try:
             creg = _query_ok_response(client, "AT+CREG?", "AT_NOT_RESPONDING", command_timeout)
             result["creg_registered"] = _is_registered(creg)
         except Exception:
             result["creg_registered"] = False
 
-        # CSQ
         try:
             client._write(b"AT+CSQ\r", timeout_code="AT_NOT_RESPONDING")
             csq = client._read_until(
@@ -237,7 +221,6 @@ def _probe_modem(
             result["signal"] = None
             result["signal_ok"] = False
 
-        # Identity
         identity = _query_identity(client, command_timeout)
         result["imsi"] = identity["imsi"]
         result["iccid"] = identity["iccid"]
@@ -254,14 +237,12 @@ def _probe_modem(
 def _build_candidate_groups() -> Dict[str, Dict[str, str]]:
     groups: Dict[str, Dict[str, str]] = {}
 
-    # Primary candidates first
     for dev in sorted(glob.glob("/dev/serial/by-id/*if02*")):
         base = os.path.basename(dev)
         physical = base.split("-if", 1)[0]
         groups.setdefault(physical, {})
         groups[physical]["if02"] = dev
 
-    # Add fallback if03 only for same physical modem
     for dev in sorted(glob.glob("/dev/serial/by-id/*if03*")):
         base = os.path.basename(dev)
         physical = base.split("-if", 1)[0]
@@ -272,7 +253,6 @@ def _build_candidate_groups() -> Dict[str, Dict[str, str]]:
 
 
 def _select_sim_id(probe: Dict[str, Any]) -> Optional[str]:
-    # Stable routing identity priority
     if probe.get("imsi"):
         return str(probe["imsi"])
     if probe.get("iccid"):
@@ -317,15 +297,26 @@ def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> 
 
                 print(f"[TRY] {port} ({interface_name}) → {probe}")
 
-                # Gold standard: real SMS port + SIM ready + registered
+                # Primary rule: if02 with AT + SIM READY + REGISTERED
                 if (
-                    probe["at_ok"]
-                    and probe["sms_capable"]
+                    interface_name == "if02"
+                    and probe["at_ok"]
                     and probe["sim_ready"]
                     and probe["creg_registered"]
                 ):
                     selected_probe = probe
                     print(f"[SELECTED] {port} ({interface_name}) ✅")
+                    break
+
+                # Fallback rule: if03 only if it also looks usable
+                if (
+                    interface_name == "if03"
+                    and probe["at_ok"]
+                    and probe["sim_ready"]
+                    and probe["creg_registered"]
+                ):
+                    selected_probe = probe
+                    print(f"[SELECTED-FALLBACK] {port} ({interface_name}) ✅")
                     break
 
             except Exception as exc:
@@ -347,7 +338,7 @@ def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> 
                 "port": selected_probe["port"],
                 "interface": selected_probe["interface"],
                 "at_ok": selected_probe["at_ok"],
-                "sms_capable": selected_probe["sms_capable"],
+                "sms_capable": selected_probe["sms_capable"],  # debug only now
                 "sim_ready": selected_probe["sim_ready"],
                 "creg_registered": selected_probe["creg_registered"],
                 "signal": selected_probe["signal"],
@@ -356,6 +347,7 @@ def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> 
                 "iccid": selected_probe["iccid"],
                 "imei": selected_probe["imei"],
                 "msisdn": selected_probe["msisdn"],
+                "cpms": selected_probe["cpms"],
             }
         )
 

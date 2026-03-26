@@ -57,15 +57,15 @@ def startup_event() -> None:
     except Exception:
         logger.exception("INITIAL_MODEM_DISCOVERY_FAILED")
 
-    refresh_thread = threading.Thread(
-        target=_auto_refresh_loop,
-        args=(registry, 5.0),
-        daemon=True,
-        name="modem-auto-refresh",
-    )
-    refresh_thread.start()
+    # refresh_thread = threading.Thread(
+    #     target=_auto_refresh_loop,
+    #     args=(registry, 5.0),
+    #     daemon=True,
+    #     name="modem-auto-refresh",
+    # )
+    # refresh_thread.start()
 
-    logger.info("AUTO_REFRESH_THREAD_STARTED")
+    # logger.info("AUTO_REFRESH_THREAD_STARTED")
 
 
 @app.post("/send", response_model=SendResponse)

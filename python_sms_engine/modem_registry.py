@@ -1,3 +1,4 @@
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -9,14 +10,15 @@ class ModemRegistry:
         self,
         serial_timeout: float,
         command_timeout: float,
-        refresh_ttl: float = 10.0,  # 🔥 auto refresh every X seconds
+        refresh_ttl: float = 10.0,
     ):
         self.serial_timeout = serial_timeout
         self.command_timeout = command_timeout
         self.refresh_ttl = refresh_ttl
 
-        self._cache: Dict[str, Dict[str, Any]] = {}  # 🔥 O(1 lookup
+        self._cache: Dict[str, Dict[str, Any]] = {}
         self._last_refresh: float = 0.0
+        self._refresh_lock = threading.Lock()
 
     def _should_refresh(self) -> bool:
         return (time.monotonic() - self._last_refresh) > self.refresh_ttl
@@ -25,29 +27,31 @@ class ModemRegistry:
         if not force and not self._should_refresh():
             return self._cache
 
-        print("[REGISTRY] Refreshing modems...")
+        with self._refresh_lock:
+            if not force and not self._should_refresh():
+                return self._cache
 
-        modems = detect_modems(
-            serial_timeout=self.serial_timeout,
-            command_timeout=self.command_timeout,
-        )
+            print("[REGISTRY] Refreshing modems...")
 
-        new_cache: Dict[str, Dict[str, Any]] = {}
+            modems = detect_modems(
+                serial_timeout=self.serial_timeout,
+                command_timeout=self.command_timeout,
+            )
 
-        for modem in modems:
-            sim_id = modem.get("sim_id")
+            new_cache: Dict[str, Dict[str, Any]] = {}
 
-            if not sim_id:
-                continue
+            for modem in modems:
+                sim_id = modem.get("sim_id")
+                if not sim_id:
+                    continue
+                new_cache[str(sim_id)] = modem
 
-            new_cache[str(sim_id)] = modem
+            self._cache = new_cache
+            self._last_refresh = time.monotonic()
 
-        self._cache = new_cache
-        self._last_refresh = time.monotonic()
+            print(f"[REGISTRY] Loaded {len(self._cache)} modems")
 
-        print(f"[REGISTRY] Loaded {len(self._cache)} modems")
-
-        return self._cache
+            return self._cache
 
     def get_all(self) -> List[Dict[str, Any]]:
         self.refresh()
