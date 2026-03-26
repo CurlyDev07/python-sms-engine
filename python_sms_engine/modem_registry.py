@@ -1,5 +1,5 @@
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from modem_detector import detect_modems
 
@@ -38,28 +38,12 @@ class ModemRegistry:
             return self.refresh()
         return self._cache
 
-    def get_by_sim_id(self, sim_id: int) -> Dict[str, Any]:
-        # 🔥 First try cached
-        modems = self.get_all()
-
-        for modem in modems:
-            if (
-                modem.get("sim_id") == sim_id
-                and modem.get("at_ok")
-                and modem.get("sim_ready")
-            ):
+    def get_by_sim_id(self, sim_id: int) -> Optional[Dict[str, Any]]:
+        # 🔥 STRICT CACHE ONLY (NO SCAN)
+        for modem in self._cache:
+            if modem.get("sim_id") == sim_id:
+                print(f"[REGISTRY HIT] sim_id={sim_id} → {modem.get('port')}")
                 return modem
 
-        # 🔥 Retry with fresh scan (important for plug/unplug recovery)
-        modems = self.refresh()
-
-        for modem in modems:
-            if (
-                modem.get("sim_id") == sim_id
-                and modem.get("at_ok")
-                and modem.get("sim_ready")
-            ):
-                return modem
-
-        # ❌ Final fail (clean + explicit)
-        raise Exception("SIM_NOT_FOUND")
+        print(f"[REGISTRY ERROR] sim_id={sim_id} NOT FOUND IN CACHE")
+        return None
