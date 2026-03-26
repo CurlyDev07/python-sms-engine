@@ -100,34 +100,55 @@ def _probe_modem(device_id: str, port: str, serial_timeout: float, command_timeo
 
 def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> List[Dict[str, Any]]:
     modems: List[Dict[str, Any]] = []
+    grouped: Dict[str, List[str]] = {}
     device_ids = sorted(glob.glob("/dev/serial/by-id/*"))
 
     for device_id in device_ids:
-        try:
-            port = os.path.realpath(device_id)
-        except Exception:
-            port = device_id
+        base = os.path.basename(device_id)
+        physical_id = base.split("-if", 1)[0]
+        grouped.setdefault(physical_id, []).append(device_id)
 
-        # Guard against malformed device paths and enforce ttyUSB usage.
-        if port.startswith("/ev/ttyUSB"):
-            port = port.replace("/ev/ttyUSB", "/dev/ttyUSB", 1)
-        if not port.startswith("/dev/ttyUSB"):
+    for _, group_device_ids in grouped.items():
+        candidates: List[Dict[str, Any]] = []
+
+        for device_id in sorted(group_device_ids):
+            try:
+                port = os.path.realpath(device_id)
+            except Exception:
+                port = device_id
+
+            # Guard against malformed device paths and enforce ttyUSB usage.
+            if port.startswith("/ev/ttyUSB"):
+                port = port.replace("/ev/ttyUSB", "/dev/ttyUSB", 1)
+            if not port.startswith("/dev/ttyUSB"):
+                continue
+
+            if not os.path.exists(port):
+                continue
+
+            try:
+                modem = _probe_modem(
+                    device_id=device_id,
+                    port=port,
+                    serial_timeout=serial_timeout,
+                    command_timeout=command_timeout,
+                )
+                if modem.get("at_ok"):
+                    candidates.append(modem)
+            except Exception as e:
+                print(f"[MODEM ERROR] {device_id} → {str(e)}")
+                continue
+
+        if not candidates:
             continue
 
-        if not os.path.exists(port):
-            continue
+        def _score(item: Dict[str, Any]) -> tuple:
+            has_signal = bool(item.get("signal"))
+            sim_ready = bool(item.get("sim_ready"))
+            at_ok = bool(item.get("at_ok"))
+            return (1 if sim_ready and has_signal else 0, 1 if sim_ready else 0, 1 if at_ok else 0)
 
-        try:
-            modem = _probe_modem(
-                device_id=device_id,
-                port=port,
-                serial_timeout=serial_timeout,
-                command_timeout=command_timeout,
-            )
-            if modem.get("at_ok"):
-                modems.append(modem)
-        except Exception as e:
-            print(f"[MODEM ERROR] {device_id} → {str(e)}")
-            continue
+        best = max(candidates, key=_score)
+        modems.append(best)
 
     return modems
