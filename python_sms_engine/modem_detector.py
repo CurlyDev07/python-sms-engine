@@ -46,7 +46,11 @@ def _probe_modem(device_id: str, port: str, serial_timeout: float, command_timeo
                 deadline=time.monotonic() + command_timeout,
                 retries=0,
             )
-            at_ok = "OK" in at_response
+            print(f"[AT RESPONSE] {device_id} → {at_response}")
+            if at_response and "OK" in at_response:
+                at_ok = True
+            else:
+                at_ok = False
         except Exception:
             at_ok = False
 
@@ -92,10 +96,6 @@ def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> 
     device_ids = sorted(glob.glob("/dev/serial/by-id/*"))
 
     for device_id in device_ids:
-        # Quectel EC25: use only interface 01 as AT/SMS port.
-        if "if01" not in device_id:
-            continue
-
         try:
             port = os.path.realpath(device_id)
         except Exception:
