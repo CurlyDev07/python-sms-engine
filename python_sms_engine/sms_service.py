@@ -20,15 +20,6 @@ def _truncate_raw(value: Optional[str]) -> Optional[str]:
     return f"{text[:RAW_MAX_LEN]}...<truncated>"
 
 
-def _fallback_port(port: str) -> Optional[str]:
-    """
-    if02 → if03 fallback
-    """
-    if "if02" in port:
-        return port.replace("if02", "if03")
-    return None
-
-
 class SmsService:
     def __init__(
         self,
@@ -148,7 +139,11 @@ class SmsService:
                     pass
 
                 # STEP 4: FAILOVER (if03)
-                fallback = _fallback_port(port)
+                # Use fallback_port stored in registry by the detector.
+                # The old string-manipulation approach no longer works because
+                # ports are now /dev/ttyUSBX paths with no "if02" in them.
+                _modem = self.registry.get_by_sim_id(sim_id)
+                fallback = _modem.get("fallback_port") if _modem else None
 
                 if fallback:
                     logger.warning(

@@ -2,9 +2,11 @@ import glob
 import os
 import re
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from at_client import ModemATClient
+
+QUECTEL_VENDOR_ID = "2c7c"
 
 
 def _extract_signal(raw: str) -> Optional[str]:
@@ -98,8 +100,10 @@ def _wait_for_creg(client: ModemATClient, timeout: float = 4.0) -> bool:
     return False
 
 
-def _get_identity(client: ModemATClient, timeout: float = 2.0) -> Dict[str, Optional[str]]:
-    data = {
+def _get_identity(
+    client: ModemATClient, timeout: float = 2.0
+) -> Dict[str, Optional[str]]:
+    data: Dict[str, Optional[str]] = {
         "imsi": None,
         "iccid": None,
         "imei": None,
@@ -135,7 +139,7 @@ def _probe_port(port: str, serial_timeout: float, command_timeout: float) -> Dic
         command_timeout=command_timeout,
     )
 
-    result = {
+    result: Dict = {
         "port": port,
         "at_ok": False,
         "sim_ready": False,
@@ -210,29 +214,88 @@ def _probe_port(port: str, serial_timeout: float, command_timeout: float) -> Dic
             client.close()
 
 
-def _build_strict_quectel_groups() -> Dict[str, Dict[str, str]]:
+def _read_sysfs_attr(path: str) -> Optional[str]:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def _sysfs_ttyusb_info(ttyusb_name: str) -> Optional[Tuple[str, int, str]]:
     """
-    Strict grouping:
-    - enumerate only /dev/serial/by-id/usb-Quectel*
-    - group by physical modem prefix before '-if'
-    - keep only if02 and if03
+    Resolves a ttyUSB device's physical USB parent and interface number via sysfs.
+
+    /sys/class/tty/ttyUSB2 is a symlink resolving to something like:
+      /sys/devices/pci.../usb1/1-2/1-2.1/1-2.1:1.2/ttyUSB2/tty/ttyUSB2
+
+    The component "1-2.1:1.2" encodes:
+      - "1-2.1"  = physical USB device (bus + port path) — unique per physical modem
+      - "1"      = configuration number
+      - "2"      = interface number (2 = if02, 3 = if03)
+
+    Returns:
+        (physical, interface_num, device_sysfs_path)
+        e.g. ("1-2.1", 2, "/sys/devices/.../1-2.1")
+    or None if the path cannot be parsed.
+    """
+    sysfs_link = f"/sys/class/tty/{ttyusb_name}"
+    if not os.path.exists(sysfs_link):
+        return None
+
+    real_path = os.path.realpath(sysfs_link)
+
+    # Match the USB interface path component: <physical>:<config>.<interface>/
+    m = re.search(r"^(.+/)(\d[\d.-]*):(\d+)\.(\d+)/", real_path)
+    if not m:
+        return None
+
+    device_sysfs = m.group(1) + m.group(2)  # e.g. /sys/devices/.../1-2.1
+    physical = m.group(2)                    # e.g. "1-2.1"
+    interface_num = int(m.group(4))          # e.g. 2
+
+    return physical, interface_num, device_sysfs
+
+
+def _build_sysfs_modem_groups() -> Dict[str, Dict[str, str]]:
+    """
+    Groups /dev/ttyUSB* devices by physical USB parent using sysfs.
+
+    - Reads USB topology directly from /sys/class/tty — no /dev/serial/by-id dependency.
+    - Filters to Quectel devices only (idVendor == 2c7c).
+    - Retains only if02 and if03 per physical modem; ignores if00 and if01.
+    - Deterministic: sorted by ttyUSB number, not hash or by-id name.
+
+    For 5 physical Quectel modems this produces exactly 5 groups.
+
+    Returns:
+        {
+            "1-2.1": {"if02": "/dev/ttyUSB2",  "if03": "/dev/ttyUSB3"},
+            "1-2.2": {"if02": "/dev/ttyUSB6",  "if03": "/dev/ttyUSB7"},
+            "1-2.3": {"if02": "/dev/ttyUSB10", "if03": "/dev/ttyUSB11"},
+            ...
+        }
     """
     groups: Dict[str, Dict[str, str]] = {}
 
-    by_id_paths = sorted(glob.glob("/dev/serial/by-id/usb-Quectel*"))
+    for ttyusb_path in sorted(glob.glob("/dev/ttyUSB*"), key=_parse_ttyusb_num):
+        ttyusb_name = os.path.basename(ttyusb_path)
+        info = _sysfs_ttyusb_info(ttyusb_name)
+        if info is None:
+            continue
 
-    for dev in by_id_paths:
-        base = os.path.basename(dev)
+        physical, interface_num, device_sysfs = info
 
-        if "-if02-" in base:
-            physical = base.split("-if02-", 1)[0]
+        vendor = _read_sysfs_attr(os.path.join(device_sysfs, "idVendor"))
+        if vendor != QUECTEL_VENDOR_ID:
+            continue
+
+        if interface_num == 2:
             groups.setdefault(physical, {})
-            groups[physical]["if02"] = os.path.realpath(dev)
-
-        elif "-if03-" in base:
-            physical = base.split("-if03-", 1)[0]
+            groups[physical]["if02"] = ttyusb_path
+        elif interface_num == 3:
             groups.setdefault(physical, {})
-            groups[physical]["if03"] = os.path.realpath(dev)
+            groups[physical]["if03"] = ttyusb_path
 
     return groups
 
@@ -242,7 +305,18 @@ def _select_sim_id(item: Dict) -> Optional[str]:
 
 
 def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> List[Dict]:
-    groups = _build_strict_quectel_groups()
+    """
+    Discovers all ready Quectel modems via sysfs USB topology.
+
+    For each physical modem:
+      1. Probe if02 first.
+      2. Fall back to if03 only if if02 is not SIM-ready.
+      3. Skip if00 and if01 entirely.
+
+    Normal case: N modems = N probes.
+    Worst case: N modems = 2N probes.
+    """
+    groups = _build_sysfs_modem_groups()
     modems: List[Dict] = []
 
     for physical_modem, ports in sorted(groups.items()):
@@ -254,36 +328,43 @@ def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> 
         best_probe = None
         best_interface = None
 
-        # STRICT RULE: probe if02 first
+        # Probe if02 first
         if primary_port and os.path.exists(primary_port):
             probe = _probe_port(primary_port, serial_timeout, command_timeout)
-            print(f"[TRY] {physical_modem} if02 -> {probe}")
+            print(f"[TRY] {physical_modem} if02 -> score={probe['score']} sim_ready={probe['sim_ready']} creg={probe['creg_registered']}")
 
             if probe["at_ok"] and probe["sim_ready"] and probe["creg_registered"]:
                 best_probe = probe
                 best_interface = "if02"
 
-        # STRICT RULE: only fallback to if03 if if02 failed
+        # Only try if03 when if02 failed
         if best_probe is None and fallback_port and os.path.exists(fallback_port):
             probe = _probe_port(fallback_port, serial_timeout, command_timeout)
-            print(f"[TRY] {physical_modem} if03 -> {probe}")
+            print(f"[TRY] {physical_modem} if03 -> score={probe['score']} sim_ready={probe['sim_ready']} creg={probe['creg_registered']}")
 
             if probe["at_ok"] and probe["sim_ready"] and probe["creg_registered"]:
                 best_probe = probe
                 best_interface = "if03"
 
         if best_probe is None:
+            print(f"[SKIP] {physical_modem} -> no usable interface found")
             continue
 
         sim_id = _select_sim_id(best_probe)
         if not sim_id:
+            print(f"[SKIP] {physical_modem} -> no identity (IMSI/ICCID/IMEI)")
             continue
+
+        # Store fallback_port for sms_service to use during send failures.
+        # If we're already on if03 (if02 failed probing), there is no further fallback.
+        stored_fallback = fallback_port if best_interface == "if02" else None
 
         modems.append(
             {
                 "sim_id": str(sim_id),
                 "device_id": physical_modem,
                 "port": best_probe["port"],
+                "fallback_port": stored_fallback,
                 "interface": best_interface,
                 "at_ok": best_probe["at_ok"],
                 "sim_ready": best_probe["sim_ready"],
@@ -295,6 +376,6 @@ def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> 
             }
         )
 
-        print(f"[SELECTED] {physical_modem} -> {best_interface} -> {best_probe['port']}")
+        print(f"[SELECTED] {physical_modem} -> {best_interface} -> {best_probe['port']} sim_id={sim_id}")
 
     return modems
