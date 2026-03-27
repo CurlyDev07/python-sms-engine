@@ -1,5 +1,6 @@
 import glob
 import os
+import re
 import time
 from typing import Dict, List, Optional
 
@@ -10,9 +11,9 @@ def _extract_signal(raw: str) -> Optional[str]:
     if not raw:
         return None
     for line in raw.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("+CSQ:"):
-            return stripped
+        s = line.strip()
+        if s.startswith("+CSQ:"):
+            return s
     return None
 
 
@@ -31,25 +32,18 @@ def _extract_first_line(raw: str) -> Optional[str]:
     return None
 
 
-def _parse_csq_value(raw: str) -> Optional[int]:
-    if not raw:
-        return None
-    for line in raw.splitlines():
-        s = line.strip()
-        if s.startswith("+CSQ:"):
-            try:
-                payload = s.split(":", 1)[1].strip()
-                return int(payload.split(",", 1)[0].strip())
-            except Exception:
-                return None
-    return None
-
-
 def _is_registered(raw: str) -> bool:
     if not raw:
         return False
     compact = raw.replace(" ", "")
     return "+CREG:0,1" in compact or "+CREG:0,5" in compact
+
+
+def _parse_ttyusb_num(port: str) -> int:
+    m = re.search(r"ttyUSB(\d+)$", port)
+    if not m:
+        return 999999
+    return int(m.group(1))
 
 
 def _cmd_expect_ok(client: ModemATClient, command: str, timeout: float) -> str:
@@ -62,6 +56,7 @@ def _cmd_expect_ok(client: ModemATClient, command: str, timeout: float) -> str:
 
 def _wait_for_cpin_ready(client: ModemATClient, timeout: float = 4.0) -> bool:
     start = time.monotonic()
+
     while time.monotonic() - start < timeout:
         try:
             client._write(b"AT+CPIN?\r", timeout_code="AT_NOT_RESPONDING")
@@ -71,17 +66,19 @@ def _wait_for_cpin_ready(client: ModemATClient, timeout: float = 4.0) -> bool:
                 timeout=1.5,
                 timeout_code="AT_NOT_RESPONDING",
             )
-            compact = resp.replace(" ", "").upper()
-            if "+CPIN:READY" in compact:
+            if "+CPIN:READY" in resp.replace(" ", "").upper():
                 return True
         except Exception:
             pass
+
         time.sleep(0.3)
+
     return False
 
 
 def _wait_for_creg(client: ModemATClient, timeout: float = 4.0) -> bool:
     start = time.monotonic()
+
     while time.monotonic() - start < timeout:
         try:
             client._write(b"AT+CREG?\r", timeout_code="AT_NOT_RESPONDING")
@@ -95,7 +92,9 @@ def _wait_for_creg(client: ModemATClient, timeout: float = 4.0) -> bool:
                 return True
         except Exception:
             pass
+
         time.sleep(0.5)
+
     return False
 
 
@@ -142,7 +141,6 @@ def _probe_port(port: str, serial_timeout: float, command_timeout: float) -> Dic
         "sim_ready": False,
         "creg_registered": False,
         "signal": None,
-        "signal_value": None,
         "imsi": None,
         "iccid": None,
         "imei": None,
@@ -155,7 +153,7 @@ def _probe_port(port: str, serial_timeout: float, command_timeout: float) -> Dic
         client.open()
         opened = True
 
-        time.sleep(0.8)
+        time.sleep(0.5)
 
         if client._serial:
             client._serial.reset_input_buffer()
@@ -184,7 +182,6 @@ def _probe_port(port: str, serial_timeout: float, command_timeout: float) -> Dic
                 timeout_code="AT_NOT_RESPONDING",
             )
             result["signal"] = _extract_signal(csq)
-            result["signal_value"] = _parse_csq_value(csq)
         except Exception:
             pass
 
@@ -213,73 +210,91 @@ def _probe_port(port: str, serial_timeout: float, command_timeout: float) -> Dic
             client.close()
 
 
+def _build_strict_quectel_groups() -> Dict[str, Dict[str, str]]:
+    """
+    Strict grouping:
+    - enumerate only /dev/serial/by-id/usb-Quectel*
+    - group by physical modem prefix before '-if'
+    - keep only if02 and if03
+    """
+    groups: Dict[str, Dict[str, str]] = {}
+
+    by_id_paths = sorted(glob.glob("/dev/serial/by-id/usb-Quectel*"))
+
+    for dev in by_id_paths:
+        base = os.path.basename(dev)
+
+        if "-if02-" in base:
+            physical = base.split("-if02-", 1)[0]
+            groups.setdefault(physical, {})
+            groups[physical]["if02"] = os.path.realpath(dev)
+
+        elif "-if03-" in base:
+            physical = base.split("-if03-", 1)[0]
+            groups.setdefault(physical, {})
+            groups[physical]["if03"] = os.path.realpath(dev)
+
+    return groups
+
+
 def _select_sim_id(item: Dict) -> Optional[str]:
     return item.get("imsi") or item.get("iccid") or item.get("imei")
 
 
 def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> List[Dict]:
-    ports = sorted(glob.glob("/dev/ttyUSB*"))
-    print(f"[SCAN PORTS] {ports}")
+    groups = _build_strict_quectel_groups()
+    modems: List[Dict] = []
 
-    all_results: List[Dict] = []
+    for physical_modem, ports in sorted(groups.items()):
+        print(f"[USB MODEM] {physical_modem} -> {ports}")
 
-    for port in ports:
-        try:
-            probe = _probe_port(port, serial_timeout, command_timeout)
-            print(f"[TRY] {port} → {probe}")
-            all_results.append(probe)
-        except Exception as exc:
-            print(f"[ERROR] {port} → {exc}")
+        primary_port = ports.get("if02")
+        fallback_port = ports.get("if03")
 
-    # keep only usable modem-ish ports
-    usable = [
-        r for r in all_results
-        if r["at_ok"] and r["imei"]
-    ]
+        best_probe = None
+        best_interface = None
 
-    # group by imei
-    by_imei: Dict[str, List[Dict]] = {}
-    for item in usable:
-        by_imei.setdefault(item["imei"], []).append(item)
+        # STRICT RULE: probe if02 first
+        if primary_port and os.path.exists(primary_port):
+            probe = _probe_port(primary_port, serial_timeout, command_timeout)
+            print(f"[TRY] {physical_modem} if02 -> {probe}")
 
-    selected_modems: List[Dict] = []
+            if probe["at_ok"] and probe["sim_ready"] and probe["creg_registered"]:
+                best_probe = probe
+                best_interface = "if02"
 
-    for imei, items in by_imei.items():
-        # choose highest score, then lower ttyUSB number
-        items = sorted(
-            items,
-            key=lambda x: (
-                -x["score"],
-                int(x["port"].replace("/dev/ttyUSB", "")) if x["port"].startswith("/dev/ttyUSB") else 9999
-            )
-        )
+        # STRICT RULE: only fallback to if03 if if02 failed
+        if best_probe is None and fallback_port and os.path.exists(fallback_port):
+            probe = _probe_port(fallback_port, serial_timeout, command_timeout)
+            print(f"[TRY] {physical_modem} if03 -> {probe}")
 
-        best = items[0]
+            if probe["at_ok"] and probe["sim_ready"] and probe["creg_registered"]:
+                best_probe = probe
+                best_interface = "if03"
 
-        # require actual usable modem
-        if not (best["sim_ready"] and best["creg_registered"]):
+        if best_probe is None:
             continue
 
-        sim_id = _select_sim_id(best)
+        sim_id = _select_sim_id(best_probe)
         if not sim_id:
             continue
 
-        selected_modems.append(
+        modems.append(
             {
                 "sim_id": str(sim_id),
-                "device_id": best["port"],
-                "port": best["port"],
-                "interface": None,
-                "at_ok": best["at_ok"],
-                "sim_ready": best["sim_ready"],
-                "creg_registered": best["creg_registered"],
-                "signal": best["signal"],
-                "imsi": best["imsi"],
-                "iccid": best["iccid"],
-                "imei": best["imei"],
+                "device_id": physical_modem,
+                "port": best_probe["port"],
+                "interface": best_interface,
+                "at_ok": best_probe["at_ok"],
+                "sim_ready": best_probe["sim_ready"],
+                "creg_registered": best_probe["creg_registered"],
+                "signal": best_probe["signal"],
+                "imsi": best_probe["imsi"],
+                "iccid": best_probe["iccid"],
+                "imei": best_probe["imei"],
             }
         )
 
-        print(f"[SELECTED] IMEI={imei} PORT={best['port']} SCORE={best['score']}")
+        print(f"[SELECTED] {physical_modem} -> {best_interface} -> {best_probe['port']}")
 
-    return selected_modems
+    return modems
