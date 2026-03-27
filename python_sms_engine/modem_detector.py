@@ -45,13 +45,16 @@ def _wait_for_cpin_ready(client: ModemATClient, timeout: float = 8.0) -> bool:
         try:
             client._write(b"AT+CPIN?\r", timeout_code="AT_NOT_RESPONDING")
             resp = client._read_until(
-                expected=["+CPIN:", "OK"],
+                expected=["OK"],
                 failure=["ERROR", "+CME ERROR", "+CMS ERROR"],
                 timeout=2.5,
                 timeout_code="AT_NOT_RESPONDING",
             )
-            if "READY" in resp:
+
+            compact = resp.replace(" ", "").upper()
+            if "+CPIN:READY" in compact:
                 return True
+
         except Exception:
             pass
 
@@ -67,13 +70,16 @@ def _wait_for_creg(client: ModemATClient, timeout: float = 12.0) -> bool:
         try:
             client._write(b"AT+CREG?\r", timeout_code="AT_NOT_RESPONDING")
             resp = client._read_until(
-                expected=["+CREG:", "OK"],
+                expected=["OK"],
                 failure=["ERROR", "+CME ERROR", "+CMS ERROR"],
                 timeout=2.5,
                 timeout_code="AT_NOT_RESPONDING",
             )
-            if _is_registered(resp):
+
+            compact = resp.replace(" ", "")
+            if "+CREG:0,1" in compact or "+CREG:0,5" in compact:
                 return True
+
         except Exception:
             pass
 
@@ -156,6 +162,7 @@ def _probe_modem(
         client.open()
         opened = True
 
+        # Allow modem stack + SIM state to settle after opening
         time.sleep(2.0)
 
         if client._serial:
@@ -187,7 +194,7 @@ def _probe_modem(
         try:
             client._write(b"AT+CSQ\r", timeout_code="AT_NOT_RESPONDING")
             csq = client._read_until(
-                expected=["+CSQ:", "OK"],
+                expected=["OK"],
                 failure=["ERROR", "+CME ERROR", "+CMS ERROR"],
                 timeout=command_timeout,
                 timeout_code="AT_NOT_RESPONDING",
