@@ -1,7 +1,7 @@
 import glob
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from at_client import ModemATClient
 
@@ -20,88 +20,61 @@ def _extract_signal(raw: str) -> Optional[str]:
     return None
 
 
-def _extract_first_meaningful_line(raw: str) -> Optional[str]:
+def _extract_first_line(raw: str) -> Optional[str]:
     if not raw:
         return None
-
     for line in raw.splitlines():
-        stripped = line.strip()
-        if not stripped:
+        s = line.strip()
+        if not s:
             continue
-        if stripped in {"OK", "ERROR"}:
+        if s in ("OK", "ERROR"):
             continue
-        if stripped.startswith("AT"):
+        if s.startswith("AT"):
             continue
-        if stripped.startswith("+CME ERROR") or stripped.startswith("+CMS ERROR"):
-            continue
-        return stripped
-
+        return s
     return None
 
 
-def _is_registered(creg_response: str) -> bool:
-    if not creg_response:
-        return False
-
-    normalized = creg_response.replace(" ", "")
-    return "+CREG:0,1" in normalized or "+CREG:0,5" in normalized
-
-
-def _parse_csq_value(raw: str) -> Optional[int]:
+def _parse_csq(raw: str) -> Optional[int]:
     if not raw:
         return None
-
     for line in raw.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("+CSQ:"):
+        if "+CSQ:" in line:
             try:
-                payload = stripped.split(":", 1)[1].strip()
-                rssi_text = payload.split(",", 1)[0].strip()
-                return int(rssi_text)
-            except Exception:
+                val = line.split(":")[1].split(",")[0].strip()
+                return int(val)
+            except:
                 return None
-
     return None
 
 
-def _is_usable_signal(raw: str) -> bool:
-    value = _parse_csq_value(raw)
-    if value is None:
+def _is_registered(raw: str) -> bool:
+    if not raw:
         return False
-    if value == 99:
-        return False
-    return value >= 5
+    return "+CREG: 0,1" in raw or "+CREG: 0,5" in raw
 
 
 # -------------------------------
-# AT wrappers
+# FIXED: SIM READY LOOP
 # -------------------------------
 
-def _query_ok_response(client, command, timeout):
-    return client._command_expect_ok(
-        command,
-        "AT_NOT_RESPONDING",
-        deadline=time.monotonic() + timeout,
-        retries=0,
-    )
-
-
-def _query_cpms(client, timeout) -> Tuple[bool, Optional[str]]:
-    try:
-        resp = _query_ok_response(client, "AT+CPMS?", timeout)
-        return "+CPMS:" in resp, resp
-    except:
-        return False, None
-
-
-def _wait_for_sim_ready(client, timeout=6) -> bool:
+def _wait_for_cpin_ready(client, timeout=8):
     start = time.monotonic()
 
     while time.monotonic() - start < timeout:
         try:
-            resp = _query_ok_response(client, "AT+CPIN?", 2)
+            client._write(b"AT+CPIN?\r", timeout_code="AT_NOT_RESPONDING")
+
+            resp = client._read_until(
+                expected=["READY", "OK"],
+                failure=["ERROR"],
+                timeout=2,
+                timeout_code="AT_NOT_RESPONDING",
+            )
+
             if "READY" in resp:
                 return True
+
         except:
             pass
 
@@ -110,51 +83,76 @@ def _wait_for_sim_ready(client, timeout=6) -> bool:
     return False
 
 
-def _query_identity(client, timeout) -> Dict[str, Optional[str]]:
-    identity = {
-        "imsi": None,
-        "iccid": None,
-        "imei": None,
-        "msisdn": None,
-    }
+# -------------------------------
+# FIXED: NETWORK REGISTER LOOP
+# -------------------------------
 
-    try:
-        identity["imsi"] = _extract_first_meaningful_line(
-            _query_ok_response(client, "AT+CIMI", timeout)
-        )
-    except:
-        pass
+def _wait_for_creg(client, timeout=12):
+    start = time.monotonic()
 
-    try:
-        resp = _query_ok_response(client, "AT+CCID", timeout)
-        line = _extract_first_meaningful_line(resp)
-        if line:
-            identity["iccid"] = line.replace("+CCID:", "").strip()
-    except:
-        pass
+    while time.monotonic() - start < timeout:
+        try:
+            client._write(b"AT+CREG?\r", timeout_code="AT_NOT_RESPONDING")
 
-    try:
-        identity["imei"] = _extract_first_meaningful_line(
-            _query_ok_response(client, "AT+GSN", timeout)
-        )
-    except:
-        pass
+            resp = client._read_until(
+                expected=["+CREG:", "OK"],
+                failure=["ERROR"],
+                timeout=2,
+                timeout_code="AT_NOT_RESPONDING",
+            )
 
-    try:
-        identity["msisdn"] = _extract_first_meaningful_line(
-            _query_ok_response(client, "AT+CNUM", timeout)
-        )
-    except:
-        pass
+            if "+CREG: 0,1" in resp or "+CREG: 0,5" in resp:
+                return True
 
-    return identity
+        except:
+            pass
+
+        time.sleep(1)
+
+    return False
 
 
 # -------------------------------
-# Probe modem
+# Identity
 # -------------------------------
 
-def _probe_modem(port, device_id, interface_name, serial_timeout, command_timeout):
+def _get_identity(client, timeout=5):
+    data = {"imsi": None, "iccid": None, "imei": None}
+
+    try:
+        resp = client._command_expect_ok(
+            "AT+CIMI", "AT_NOT_RESPONDING", time.monotonic() + timeout
+        )
+        data["imsi"] = _extract_first_line(resp)
+    except:
+        pass
+
+    try:
+        resp = client._command_expect_ok(
+            "AT+CCID", "AT_NOT_RESPONDING", time.monotonic() + timeout
+        )
+        val = _extract_first_line(resp)
+        if val:
+            data["iccid"] = val.replace("+CCID:", "").strip()
+    except:
+        pass
+
+    try:
+        resp = client._command_expect_ok(
+            "AT+GSN", "AT_NOT_RESPONDING", time.monotonic() + timeout
+        )
+        data["imei"] = _extract_first_line(resp)
+    except:
+        pass
+
+    return data
+
+
+# -------------------------------
+# PROBE
+# -------------------------------
+
+def _probe_modem(port, device_id, iface, serial_timeout, command_timeout):
     client = ModemATClient(
         port=port,
         serial_timeout=serial_timeout,
@@ -164,18 +162,14 @@ def _probe_modem(port, device_id, interface_name, serial_timeout, command_timeou
     result = {
         "device_id": device_id,
         "port": port,
-        "interface": interface_name,
+        "interface": iface,
         "at_ok": False,
-        "sms_capable": False,
         "sim_ready": False,
         "creg_registered": False,
         "signal": None,
-        "signal_ok": False,
-        "cpms": None,
         "imsi": None,
         "iccid": None,
         "imei": None,
-        "msisdn": None,
     }
 
     opened = False
@@ -184,41 +178,36 @@ def _probe_modem(port, device_id, interface_name, serial_timeout, command_timeou
         client.open()
         opened = True
 
-        # 🔥 FIX: WAIT FOR MODEM READY
-        time.sleep(0.8)
+        # 🔥 CRITICAL FIX: FULL BOOT WAIT
+        time.sleep(2.0)
 
         if client._serial:
             client._serial.reset_input_buffer()
 
         # AT
         try:
-            at_resp = _query_ok_response(client, "AT", command_timeout)
-            result["at_ok"] = "OK" in at_resp
+            resp = client._command_expect_ok(
+                "AT", "AT_NOT_RESPONDING", time.monotonic() + command_timeout
+            )
+            result["at_ok"] = "OK" in resp
         except:
             return result
 
-        # Disable echo
+        # disable echo
         try:
-            _query_ok_response(client, "ATE0", command_timeout)
+            client._command_expect_ok(
+                "ATE0", "AT_NOT_RESPONDING", time.monotonic() + command_timeout
+            )
         except:
             pass
 
-        # CPMS (debug only)
-        cpms_ok, cpms_resp = _query_cpms(client, command_timeout)
-        result["sms_capable"] = cpms_ok
-        result["cpms"] = cpms_resp
+        # 🔥 SIM READY
+        result["sim_ready"] = _wait_for_cpin_ready(client)
 
-        # 🔥 FIX: WAIT FOR SIM READY
-        result["sim_ready"] = _wait_for_sim_ready(client)
+        # 🔥 NETWORK READY
+        result["creg_registered"] = _wait_for_creg(client)
 
-        # CREG
-        try:
-            creg = _query_ok_response(client, "AT+CREG?", command_timeout)
-            result["creg_registered"] = _is_registered(creg)
-        except:
-            pass
-
-        # CSQ
+        # SIGNAL
         try:
             client._write(b"AT+CSQ\r", timeout_code="AT_NOT_RESPONDING")
             csq = client._read_until(
@@ -228,12 +217,11 @@ def _probe_modem(port, device_id, interface_name, serial_timeout, command_timeou
                 timeout_code="AT_NOT_RESPONDING",
             )
             result["signal"] = _extract_signal(csq)
-            result["signal_ok"] = _is_usable_signal(csq)
         except:
             pass
 
-        # Identity
-        identity = _query_identity(client, command_timeout)
+        # IDENTITY
+        identity = _get_identity(client)
         result.update(identity)
 
         return result
@@ -244,10 +232,10 @@ def _probe_modem(port, device_id, interface_name, serial_timeout, command_timeou
 
 
 # -------------------------------
-# Build groups
+# GROUPING
 # -------------------------------
 
-def _build_candidate_groups():
+def _build_groups():
     groups = {}
 
     for dev in glob.glob("/dev/serial/by-id/*if02*"):
@@ -263,36 +251,32 @@ def _build_candidate_groups():
     return groups
 
 
-def _select_sim_id(probe):
-    return probe.get("imsi") or probe.get("iccid") or probe.get("imei")
+def _select_id(p):
+    return p.get("imsi") or p.get("iccid") or p.get("imei")
 
 
 # -------------------------------
-# MAIN DETECT
+# MAIN
 # -------------------------------
 
 def detect_modems(serial_timeout=3.0, command_timeout=5.0):
     modems = []
-    groups = _build_candidate_groups()
+    groups = _build_groups()
 
-    for physical_id, interfaces in groups.items():
-        print(f"[GROUP] {physical_id} → {interfaces}")
+    for physical, ifaces in groups.items():
+        print(f"[GROUP] {physical} → {ifaces}")
 
         selected = None
 
         for iface in ("if02", "if03"):
-            dev = interfaces.get(iface)
+            dev = ifaces.get(iface)
             if not dev:
                 continue
 
             port = os.path.realpath(dev)
 
             probe = _probe_modem(
-                port,
-                dev,
-                iface,
-                serial_timeout,
-                command_timeout,
+                port, dev, iface, serial_timeout, command_timeout
             )
 
             print(f"[TRY] {port} ({iface}) → {probe}")
@@ -309,16 +293,14 @@ def detect_modems(serial_timeout=3.0, command_timeout=5.0):
         if not selected:
             continue
 
-        sim_id = _select_sim_id(selected)
+        sim_id = _select_id(selected)
         if not sim_id:
             continue
 
         modems.append({
             "sim_id": str(sim_id),
-            "device_id": selected["device_id"],
             "port": selected["port"],
             "interface": selected["interface"],
-            "at_ok": selected["at_ok"],
             "sim_ready": selected["sim_ready"],
             "creg_registered": selected["creg_registered"],
             "signal": selected["signal"],
