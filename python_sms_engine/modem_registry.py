@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -23,15 +24,41 @@ class ModemRegistry:
     def _should_refresh(self) -> bool:
         return (time.monotonic() - self._last_refresh) > self.refresh_ttl
 
+    def _all_ports_present(self) -> bool:
+        """
+        Warm-refresh check: verify every cached modem's port still exists on the filesystem.
+
+        This is essentially free (no serial I/O). It covers the common case where
+        nothing has changed — the modems are still plugged in and the ports are stable.
+
+        Returns False (triggering a full re-scan) only when a port disappears, which
+        means a modem was physically unplugged or the kernel reassigned the device node.
+        """
+        for sim_id, modem in self._cache.items():
+            port = modem.get("port")
+            if not port or not os.path.exists(port):
+                print(f"[REGISTRY] Port gone: sim_id={sim_id} port={port} — full rescan needed")
+                return False
+        return True
+
     def refresh(self, force: bool = False) -> Dict[str, Dict[str, Any]]:
         if not force and not self._should_refresh():
             return self._cache
 
         with self._refresh_lock:
+            # Re-check inside the lock — another thread may have just refreshed
             if not force and not self._should_refresh():
                 return self._cache
 
-            print("[REGISTRY] Refreshing modems...")
+            # Warm refresh: cache is populated and all ports still exist.
+            # Skip full sysfs scan + probe — just update the TTL timestamp.
+            if not force and self._cache and self._all_ports_present():
+                print(f"[REGISTRY] Warm refresh — {len(self._cache)} modems still present, skipping scan")
+                self._last_refresh = time.monotonic()
+                return self._cache
+
+            # Cold or forced refresh: full sysfs enumeration + probe
+            print("[REGISTRY] Full scan starting...")
 
             modems = detect_modems(
                 serial_timeout=self.serial_timeout,
