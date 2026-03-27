@@ -250,7 +250,21 @@ def _sysfs_ttyusb_info(ttyusb_name: str) -> Optional[Tuple[str, int, str]]:
     if not m:
         return None
 
-    device_sysfs = m.group(1) + m.group(2)  # e.g. /sys/devices/.../1-2.1
+    # group(1) ends with the slash AFTER the physical device dir, e.g. ".../1-2/"
+    # group(2) is the physical device dir name, e.g. "1-2.1"
+    # So physical device sysfs path = group(1) stripped of trailing slash + "/" + group(2)
+    # which is the same as: group(1) + group(2) would be WRONG (duplicates the dir name)
+    # Correct: the physical device dir is group(1).rstrip("/") since group(1) already
+    # ends at the slash that follows the physical device directory.
+    #
+    # Path breakdown:
+    #   /sys/devices/.../1-2/    1-2.1/    1-2.1:1.2/usb_serial/ttyUSBX/tty/ttyUSBX
+    #                  ^^^^^^^^  ^^^^^^    ^^^^^^^^^^
+    #                  group(1)  group(2)  interface (not captured directly)
+    #
+    # group(1) = "/sys/devices/.../1-2/1-2.1/"  ← includes trailing slash
+    # So the physical device sysfs dir = group(1) without its trailing slash
+    device_sysfs = m.group(1).rstrip("/")    # e.g. /sys/devices/.../1-2/1-2.1
     physical = m.group(2)                    # e.g. "1-2.1"
     interface_num = int(m.group(4))          # e.g. 2
 
@@ -278,15 +292,21 @@ def _build_sysfs_modem_groups() -> Dict[str, Dict[str, str]]:
     """
     groups: Dict[str, Dict[str, str]] = {}
 
-    for ttyusb_path in sorted(glob.glob("/dev/ttyUSB*"), key=_parse_ttyusb_num):
+    all_tty = sorted(glob.glob("/dev/ttyUSB*"), key=_parse_ttyusb_num)
+    print(f"[SYSFS SCAN] found {len(all_tty)} ttyUSB devices: {all_tty}")
+
+    for ttyusb_path in all_tty:
         ttyusb_name = os.path.basename(ttyusb_path)
         info = _sysfs_ttyusb_info(ttyusb_name)
         if info is None:
+            print(f"[SYSFS SKIP] {ttyusb_name} -> could not parse sysfs path")
             continue
 
         physical, interface_num, device_sysfs = info
 
         vendor = _read_sysfs_attr(os.path.join(device_sysfs, "idVendor"))
+        print(f"[SYSFS]  {ttyusb_name} -> physical={physical} if={interface_num} vendor={vendor} sysfs={device_sysfs}")
+
         if vendor != QUECTEL_VENDOR_ID:
             continue
 
@@ -297,6 +317,7 @@ def _build_sysfs_modem_groups() -> Dict[str, Dict[str, str]]:
             groups.setdefault(physical, {})
             groups[physical]["if03"] = ttyusb_path
 
+    print(f"[SYSFS GROUPS] {groups}")
     return groups
 
 
