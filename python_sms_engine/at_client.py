@@ -1,6 +1,7 @@
 import os
+import re
 import time
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Tuple
 
 import serial
 
@@ -18,12 +19,41 @@ ALLOWED_ERRORS = {
 }
 
 
+def _parse_at_error_codes(raw: str) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Extract numeric codes from +CMS ERROR and +CME ERROR responses.
+
+    +CMS ERROR = network/carrier layer (e.g. 50 = no credit, 38 = network down)
+    +CME ERROR = modem/equipment layer (e.g. 10 = SIM not inserted, 13 = SIM failure)
+
+    Returns (cms_code, cme_code). Either or both may be None.
+    """
+    cms_code: Optional[int] = None
+    cme_code: Optional[int] = None
+    for line in raw.splitlines():
+        m = re.search(r"\+CMS ERROR:\s*(\d+)", line)
+        if m:
+            cms_code = int(m.group(1))
+        m = re.search(r"\+CME ERROR:\s*(\d+)", line)
+        if m:
+            cme_code = int(m.group(1))
+    return cms_code, cme_code
+
+
 class SMSExecutionError(Exception):
-    def __init__(self, code: str, raw: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        raw: Optional[str] = None,
+        cms_code: Optional[int] = None,
+        cme_code: Optional[int] = None,
+    ) -> None:
         if code not in ALLOWED_ERRORS:
             code = "UNKNOWN_ERROR"
         self.code = code
         self.raw = raw
+        self.cms_code = cms_code   # network/carrier error code
+        self.cme_code = cme_code   # modem/equipment error code
         super().__init__(code)
 
 
@@ -151,8 +181,14 @@ class ModemATClient:
         raise SMSExecutionError(fail_code, raw=last_response)
 
     def _parse_final_response(self, response: str) -> bool:
-        if "ERROR" in response or "+CMS ERROR" in response or "+CME ERROR" in response:
-            raise SMSExecutionError("SEND_FAILED", raw=response)
+        if "+CMS ERROR" in response or "+CME ERROR" in response or "ERROR" in response:
+            cms_code, cme_code = _parse_at_error_codes(response)
+            raise SMSExecutionError(
+                "SEND_FAILED",
+                raw=response,
+                cms_code=cms_code,
+                cme_code=cme_code,
+            )
         if "+CMGS:" in response or "OK" in response:
             return True
         raise SMSExecutionError("UNKNOWN_ERROR", raw=response)

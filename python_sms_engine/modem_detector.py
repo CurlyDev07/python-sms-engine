@@ -58,7 +58,6 @@ def _cmd_expect_ok(client: ModemATClient, command: str, timeout: float) -> str:
 
 def _wait_for_cpin_ready(client: ModemATClient, timeout: float = 4.0) -> bool:
     start = time.monotonic()
-
     while time.monotonic() - start < timeout:
         try:
             client._write(b"AT+CPIN?\r", timeout_code="AT_NOT_RESPONDING")
@@ -72,15 +71,12 @@ def _wait_for_cpin_ready(client: ModemATClient, timeout: float = 4.0) -> bool:
                 return True
         except Exception:
             pass
-
         time.sleep(0.3)
-
     return False
 
 
 def _wait_for_creg(client: ModemATClient, timeout: float = 4.0) -> bool:
     start = time.monotonic()
-
     while time.monotonic() - start < timeout:
         try:
             client._write(b"AT+CREG?\r", timeout_code="AT_NOT_RESPONDING")
@@ -94,20 +90,14 @@ def _wait_for_creg(client: ModemATClient, timeout: float = 4.0) -> bool:
                 return True
         except Exception:
             pass
-
         time.sleep(0.5)
-
     return False
 
 
 def _get_identity(
     client: ModemATClient, timeout: float = 2.0
 ) -> Dict[str, Optional[str]]:
-    data: Dict[str, Optional[str]] = {
-        "imsi": None,
-        "iccid": None,
-        "imei": None,
-    }
+    data: Dict[str, Optional[str]] = {"imsi": None, "iccid": None, "imei": None}
 
     try:
         resp = _cmd_expect_ok(client, "AT+CIMI", timeout)
@@ -152,13 +142,11 @@ def _probe_port(port: str, serial_timeout: float, command_timeout: float) -> Dic
     }
 
     opened = False
-
     try:
         client.open()
         opened = True
 
         time.sleep(0.5)
-
         if client._serial:
             client._serial.reset_input_buffer()
             client._serial.reset_output_buffer()
@@ -193,18 +181,12 @@ def _probe_port(port: str, serial_timeout: float, command_timeout: float) -> Dic
         result.update(identity)
 
         score = 0
-        if result["at_ok"]:
-            score += 1
-        if result["imei"]:
-            score += 2
-        if result["sim_ready"]:
-            score += 4
-        if result["creg_registered"]:
-            score += 4
-        if result["imsi"]:
-            score += 3
-        if result["iccid"]:
-            score += 3
+        if result["at_ok"]:        score += 1
+        if result["imei"]:         score += 2
+        if result["sim_ready"]:    score += 4
+        if result["creg_registered"]: score += 4
+        if result["imsi"]:         score += 3
+        if result["iccid"]:        score += 3
         result["score"] = score
 
         return result
@@ -226,99 +208,73 @@ def _sysfs_ttyusb_info(ttyusb_name: str) -> Optional[Tuple[str, int, str]]:
     """
     Resolves a ttyUSB device's physical USB parent and interface number via sysfs.
 
-    /sys/class/tty/ttyUSB2 is a symlink resolving to something like:
-      /sys/devices/pci.../usb1/1-2/1-2.1/1-2.1:1.2/ttyUSB2/tty/ttyUSB2
+    /sys/class/tty/ttyUSBX symlink resolves to a path containing:
+        .../<physical>:<config>.<interface>/...
+    e.g.  .../3-7.4.4:1.2/...  →  physical="3-7.4.4", interface=2
 
-    The component "1-2.1:1.2" encodes:
-      - "1-2.1"  = physical USB device (bus + port path) — unique per physical modem
-      - "1"      = configuration number
-      - "2"      = interface number (2 = if02, 3 = if03)
-
-    Returns:
-        (physical, interface_num, device_sysfs_path)
-        e.g. ("1-2.1", 2, "/sys/devices/.../1-2.1")
-    or None if the path cannot be parsed.
+    Returns (physical, interface_num, device_sysfs_path) or None.
     """
     sysfs_link = f"/sys/class/tty/{ttyusb_name}"
     if not os.path.exists(sysfs_link):
         return None
 
     real_path = os.path.realpath(sysfs_link)
-
-    # Match the USB interface path component: <physical>:<config>.<interface>/
     m = re.search(r"^(.+/)(\d[\d.-]*):(\d+)\.(\d+)/", real_path)
     if not m:
         return None
 
-    # group(1) ends with the slash AFTER the physical device dir, e.g. ".../1-2/"
-    # group(2) is the physical device dir name, e.g. "1-2.1"
-    # So physical device sysfs path = group(1) stripped of trailing slash + "/" + group(2)
-    # which is the same as: group(1) + group(2) would be WRONG (duplicates the dir name)
-    # Correct: the physical device dir is group(1).rstrip("/") since group(1) already
-    # ends at the slash that follows the physical device directory.
-    #
-    # Path breakdown:
-    #   /sys/devices/.../1-2/    1-2.1/    1-2.1:1.2/usb_serial/ttyUSBX/tty/ttyUSBX
-    #                  ^^^^^^^^  ^^^^^^    ^^^^^^^^^^
-    #                  group(1)  group(2)  interface (not captured directly)
-    #
-    # group(1) = "/sys/devices/.../1-2/1-2.1/"  ← includes trailing slash
-    # So the physical device sysfs dir = group(1) without its trailing slash
-    device_sysfs = m.group(1).rstrip("/")    # e.g. /sys/devices/.../1-2/1-2.1
-    physical = m.group(2)                    # e.g. "1-2.1"
-    interface_num = int(m.group(4))          # e.g. 2
+    # group(1) ends with "/" after the physical device dir, e.g. ".../3-7.4/"
+    # group(2) is the physical device component, e.g. "3-7.4.4"
+    # So device_sysfs = group(1) stripped of its trailing slash
+    device_sysfs = m.group(1).rstrip("/")
+    physical = m.group(2)
+    interface_num = int(m.group(4))
 
     return physical, interface_num, device_sysfs
 
 
-def _build_sysfs_modem_groups() -> Dict[str, Dict[str, str]]:
+def _collect_if02_ports() -> List[Tuple[str, str, Optional[str]]]:
     """
-    Groups /dev/ttyUSB* devices by physical USB parent using sysfs.
+    Single-pass sysfs scan. Collects only Quectel if=2 ports as primaries,
+    and their if=3 siblings as fallback (derived, never probed at startup).
 
-    - Reads USB topology directly from /sys/class/tty — no /dev/serial/by-id dependency.
-    - Filters to Quectel devices only (idVendor == 2c7c).
-    - Retains only if02 and if03 per physical modem; ignores if00 and if01.
-    - Deterministic: sorted by ttyUSB number, not hash or by-id name.
+    Returns list of:
+        (physical_parent, if02_port, if03_port_or_None)
 
-    For 5 physical Quectel modems this produces exactly 5 groups.
-
-    Returns:
-        {
-            "1-2.1": {"if02": "/dev/ttyUSB2",  "if03": "/dev/ttyUSB3"},
-            "1-2.2": {"if02": "/dev/ttyUSB6",  "if03": "/dev/ttyUSB7"},
-            "1-2.3": {"if02": "/dev/ttyUSB10", "if03": "/dev/ttyUSB11"},
-            ...
-        }
+    For 5 physical modems → exactly 5 entries.
+    No probe I/O at this stage — pure sysfs reads.
     """
-    groups: Dict[str, Dict[str, str]] = {}
+    if02: Dict[str, str] = {}
+    if03: Dict[str, str] = {}
 
     all_tty = sorted(glob.glob("/dev/ttyUSB*"), key=_parse_ttyusb_num)
-    print(f"[SYSFS SCAN] found {len(all_tty)} ttyUSB devices: {all_tty}")
+    print(f"[SYSFS SCAN] {len(all_tty)} ttyUSB devices found")
 
     for ttyusb_path in all_tty:
         ttyusb_name = os.path.basename(ttyusb_path)
         info = _sysfs_ttyusb_info(ttyusb_name)
         if info is None:
-            print(f"[SYSFS SKIP] {ttyusb_name} -> could not parse sysfs path")
             continue
 
         physical, interface_num, device_sysfs = info
-
         vendor = _read_sysfs_attr(os.path.join(device_sysfs, "idVendor"))
-        print(f"[SYSFS]  {ttyusb_name} -> physical={physical} if={interface_num} vendor={vendor} sysfs={device_sysfs}")
 
         if vendor != QUECTEL_VENDOR_ID:
             continue
 
         if interface_num == 2:
-            groups.setdefault(physical, {})
-            groups[physical]["if02"] = ttyusb_path
+            if02[physical] = ttyusb_path
+            print(f"[SYSFS] {ttyusb_name} -> {physical} if02 (primary)")
         elif interface_num == 3:
-            groups.setdefault(physical, {})
-            groups[physical]["if03"] = ttyusb_path
+            if03[physical] = ttyusb_path
+            print(f"[SYSFS] {ttyusb_name} -> {physical} if03 (fallback, not probed)")
 
-    print(f"[SYSFS GROUPS] {groups}")
-    return groups
+    result = [
+        (physical, port, if03.get(physical))
+        for physical, port in sorted(if02.items())
+    ]
+    print(f"[SYSFS] {len(result)} modem groups: { {p: (p2, f) for p, p2, f in result} }")
+    return result
 
 
 def _select_sim_id(item: Dict) -> Optional[str]:
@@ -327,76 +283,62 @@ def _select_sim_id(item: Dict) -> Optional[str]:
 
 def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> List[Dict]:
     """
-    Discovers all ready Quectel modems via sysfs USB topology.
+    Discovers ready Quectel modems via sysfs USB topology.
 
-    For each physical modem:
-      1. Probe if02 first.
-      2. Fall back to if03 only if if02 is not SIM-ready.
-      3. Skip if00 and if01 entirely.
+    Strategy:
+      - Enumerate only if=2 ports (one per physical modem).
+      - Probe only if=2. if=3 is stored as fallback_port, never probed here.
+      - A modem is accepted only when: at_ok + sim_ready + creg_registered.
+      - sim_id  = IMSI (preferred) → ICCID → IMEI
+      - modem_id = IMEI (hardware identity, separate from SIM identity)
 
-    Normal case: N modems = N probes.
-    Worst case: N modems = 2N probes.
+    N modems = exactly N probes (worst case). No if=3 probing at startup.
     """
-    groups = _build_sysfs_modem_groups()
+    entries = _collect_if02_ports()
     modems: List[Dict] = []
 
-    for physical_modem, ports in sorted(groups.items()):
-        print(f"[USB MODEM] {physical_modem} -> {ports}")
+    for physical, primary_port, fallback_port in entries:
+        print(f"[PROBE] {physical} -> {primary_port} (fallback: {fallback_port})")
 
-        primary_port = ports.get("if02")
-        fallback_port = ports.get("if03")
-
-        best_probe = None
-        best_interface = None
-
-        # Probe if02 first
-        if primary_port and os.path.exists(primary_port):
-            probe = _probe_port(primary_port, serial_timeout, command_timeout)
-            print(f"[TRY] {physical_modem} if02 -> score={probe['score']} sim_ready={probe['sim_ready']} creg={probe['creg_registered']}")
-
-            if probe["at_ok"] and probe["sim_ready"] and probe["creg_registered"]:
-                best_probe = probe
-                best_interface = "if02"
-
-        # Only try if03 when if02 failed
-        if best_probe is None and fallback_port and os.path.exists(fallback_port):
-            probe = _probe_port(fallback_port, serial_timeout, command_timeout)
-            print(f"[TRY] {physical_modem} if03 -> score={probe['score']} sim_ready={probe['sim_ready']} creg={probe['creg_registered']}")
-
-            if probe["at_ok"] and probe["sim_ready"] and probe["creg_registered"]:
-                best_probe = probe
-                best_interface = "if03"
-
-        if best_probe is None:
-            print(f"[SKIP] {physical_modem} -> no usable interface found")
+        if not os.path.exists(primary_port):
+            print(f"[SKIP] {physical} -> port gone")
             continue
 
-        sim_id = _select_sim_id(best_probe)
+        probe = _probe_port(primary_port, serial_timeout, command_timeout)
+        print(
+            f"[TRY] {physical} if02={primary_port} "
+            f"score={probe['score']} sim_ready={probe['sim_ready']} creg={probe['creg_registered']}"
+        )
+
+        if not (probe["at_ok"] and probe["sim_ready"] and probe["creg_registered"]):
+            print(f"[SKIP] {physical} -> if02 not ready (sim_ready={probe['sim_ready']} creg={probe['creg_registered']})")
+            continue
+
+        sim_id = _select_sim_id(probe)
         if not sim_id:
-            print(f"[SKIP] {physical_modem} -> no identity (IMSI/ICCID/IMEI)")
+            print(f"[SKIP] {physical} -> no SIM identity (IMSI/ICCID/IMEI all missing)")
             continue
-
-        # Store fallback_port for sms_service to use during send failures.
-        # If we're already on if03 (if02 failed probing), there is no further fallback.
-        stored_fallback = fallback_port if best_interface == "if02" else None
 
         modems.append(
             {
-                "sim_id": str(sim_id),
-                "device_id": physical_modem,
-                "port": best_probe["port"],
-                "fallback_port": stored_fallback,
-                "interface": best_interface,
-                "at_ok": best_probe["at_ok"],
-                "sim_ready": best_probe["sim_ready"],
-                "creg_registered": best_probe["creg_registered"],
-                "signal": best_probe["signal"],
-                "imsi": best_probe["imsi"],
-                "iccid": best_probe["iccid"],
-                "imei": best_probe["imei"],
+                "sim_id":       str(sim_id),
+                "modem_id":     probe.get("imei"),   # IMEI = hardware identity
+                "device_id":    physical,
+                "port":         primary_port,
+                "fallback_port": fallback_port,       # if03, stored but not probed
+                "interface":    "if02",
+                "at_ok":        probe["at_ok"],
+                "sim_ready":    probe["sim_ready"],
+                "creg_registered": probe["creg_registered"],
+                "signal":       probe["signal"],
+                "imsi":         probe["imsi"],
+                "iccid":        probe["iccid"],
+                "imei":         probe["imei"],
             }
         )
-
-        print(f"[SELECTED] {physical_modem} -> {best_interface} -> {best_probe['port']} sim_id={sim_id}")
+        print(
+            f"[SELECTED] {physical} -> {primary_port} "
+            f"sim_id={sim_id} modem_id={probe.get('imei')}"
+        )
 
     return modems
