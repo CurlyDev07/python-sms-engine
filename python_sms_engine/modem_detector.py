@@ -304,7 +304,12 @@ def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> 
             print(f"[SKIP] {physical} -> port gone")
             continue
 
-        probe = _probe_port(primary_port, serial_timeout, command_timeout)
+        try:
+            probe = _probe_port(primary_port, serial_timeout, command_timeout)
+        except Exception as exc:
+            print(f"[SKIP] {physical} -> probe failed ({exc})")
+            continue
+
         print(
             f"[TRY] {physical} if02={primary_port} "
             f"score={probe['score']} sim_ready={probe['sim_ready']} creg={probe['creg_registered']}"
