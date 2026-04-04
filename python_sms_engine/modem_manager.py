@@ -24,6 +24,7 @@ class ModemManager:
             started_at = time.monotonic()
 
             sim_id = str(modem.get("sim_id")) if modem.get("sim_id") else None
+            modem_id = str(modem.get("modem_id")) if modem.get("modem_id") else None
             port = str(modem.get("port") or "")
             at_ok = bool(modem.get("at_ok"))
             reachable = bool(port)
@@ -33,8 +34,9 @@ class ModemManager:
             duration_ms = int((time.monotonic() - started_at) * 1000)
 
             logger.info(
-                "MODEM_HEALTH_CHECK sim_id=%s port=%s duration_ms=%s error=%s",
+                "MODEM_HEALTH_CHECK sim_id=%s modem_id=%s port=%s duration_ms=%s error=%s",
                 sim_id,
+                modem_id,
                 port,
                 duration_ms,
                 error,
@@ -43,6 +45,7 @@ class ModemManager:
             results.append(
                 ModemHealthItem(
                     sim_id=sim_id,
+                    modem_id=modem_id,
                     port=port,
                     reachable=reachable,
                     at_ok=at_ok,

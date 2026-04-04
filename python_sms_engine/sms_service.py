@@ -85,7 +85,8 @@ class SmsService:
         meta: Optional[Dict[str, Any]] = None,
     ) -> SendResponse:
 
-        del meta
+        meta = meta or {}
+        message_id = str(meta["message_id"]) if meta.get("message_id") is not None else None
         port: Optional[str] = None
         started_at = time.monotonic()
 
@@ -113,6 +114,7 @@ class SmsService:
 
                 return SendResponse(
                     success=True,
+                    message_id=message_id,
                     error=None,
                     raw={
                         "sim_id": sim_id,
@@ -120,6 +122,7 @@ class SmsService:
                         "port": port,
                         "status": "success",
                         "modem_response": merged_raw,
+                        "meta": meta,
                     },
                 )
 
@@ -142,12 +145,14 @@ class SmsService:
 
                     return SendResponse(
                         success=True,
+                        message_id=message_id,
                         error=None,
                         raw={
                             "sim_id": sim_id,
                             "modem_id": modem_id,
                             "port": port,
                             "status": "retry_success",
+                            "meta": meta,
                         },
                     )
 
@@ -174,12 +179,14 @@ class SmsService:
 
                         return SendResponse(
                             success=True,
+                            message_id=message_id,
                             error=None,
                             raw={
                                 "sim_id": sim_id,
                                 "modem_id": modem_id,
                                 "port": fallback,
                                 "status": "fallback_success",
+                                "meta": meta,
                             },
                         )
 
@@ -207,6 +214,7 @@ class SmsService:
 
             return SendResponse(
                 success=False,
+                message_id=message_id,
                 error=exc.code,
                 raw={
                     "sim_id": sim_id,
@@ -216,6 +224,7 @@ class SmsService:
                     "cms_error_code": exc.cms_code,
                     "cme_error_code": exc.cme_code,
                     "modem_response": _truncate_raw(exc.raw),
+                    "meta": meta,
                 },
             )
 
@@ -228,6 +237,7 @@ class SmsService:
 
             return SendResponse(
                 success=False,
+                message_id=message_id,
                 error="UNKNOWN_ERROR",
                 raw={
                     "sim_id": sim_id,
@@ -237,5 +247,6 @@ class SmsService:
                     "cms_error_code": None,
                     "cme_error_code": None,
                     "modem_response": None,
+                    "meta": meta,
                 },
             )

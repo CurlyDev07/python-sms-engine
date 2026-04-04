@@ -23,7 +23,8 @@ class HealthResponse(BaseModel):
 
 
 class ModemHealthItem(BaseModel):
-    sim_id: Optional[str] = None   # 🔥 CHANGED
+    sim_id: Optional[str] = None
+    modem_id: Optional[str] = None
     port: str
     reachable: bool
     at_ok: bool
