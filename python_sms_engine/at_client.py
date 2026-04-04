@@ -273,6 +273,13 @@ class ModemATClient:
             print("[STEP] AT OK")
             time.sleep(0.1)
 
+            # RESET MODEM STATE (clears any dirty state left by other processes)
+            try:
+                self._command_expect_ok("ATZ", "AT_NOT_RESPONDING", deadline=deadline, retries=0)
+            except SMSExecutionError:
+                pass  # ATZ failure is non-fatal
+            time.sleep(0.3)
+
             # DISABLE ECHO
             responses["ate0"] = self._command_expect_ok(
                 "ATE0",
