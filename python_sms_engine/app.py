@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from config import settings
 from modem_manager import ModemManager
 from modem_registry import ModemRegistry
-from schemas import HealthResponse, ModemsHealthResponse, SendRequest, SendResponse
+from schemas import HealthResponse, ModemsDiscoverResponse, ModemsHealthResponse, SendRequest, SendResponse
 from sms_service import SmsService
 
 logging.basicConfig(
@@ -90,16 +90,16 @@ def modems_health() -> ModemsHealthResponse:
     return ModemsHealthResponse(success=True, modems=manager.health())
 
 
-@app.get("/modems/discover")
-def discover_modems() -> dict:
+@app.get("/modems/discover", response_model=ModemsDiscoverResponse)
+def discover_modems() -> ModemsDiscoverResponse:
     try:
         registry: ModemRegistry = app.state.modem_registry
         registry.refresh(force=True)
         modems = registry.get_all()
-        return {"success": True, "modems": modems}
+        return ModemsDiscoverResponse(success=True, modems=modems)
     except Exception:
         logger.exception("MODEM_DISCOVERY_FAILED")
-        return {"success": False, "error": "DISCOVERY_FAILED", "modems": []}
+        return ModemsDiscoverResponse(success=False, modems=[])
 
 
 @app.get("/modems/summary")
