@@ -129,7 +129,12 @@ class SmsService:
                     sim_id, modem_id, port, primary_error.code,
                 )
 
-                # STEP 3: retry on same port
+                # Network/modem errors (CMS/CME) won't be fixed by retrying a
+                # different port — fail immediately so Laravel gets the error fast.
+                if primary_error.cms_code is not None or primary_error.cme_code is not None:
+                    raise primary_error
+
+                # STEP 3: retry on same port (hardware errors only)
                 try:
                     time.sleep(0.5)
                     raw_steps = self._send_via_port(port, phone, message)
@@ -149,7 +154,7 @@ class SmsService:
                 except SMSExecutionError:
                     pass
 
-                # STEP 4: failover to if03
+                # STEP 4: failover to if03 (hardware errors only)
                 _modem = self.registry.get_by_sim_id(sim_id)
                 fallback = _modem.get("fallback_port") if _modem else None
 
