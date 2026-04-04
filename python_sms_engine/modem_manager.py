@@ -78,7 +78,6 @@ class ModemManager:
         for modem in modems:
             if (
                 modem.get("at_ok")
-                and modem.get("sms_capable")
                 and modem.get("sim_ready")
                 and modem.get("creg_registered")
             ):

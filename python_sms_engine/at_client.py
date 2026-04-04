@@ -362,7 +362,7 @@ class ModemATClient:
 
             merged_raw = "\n".join(part for part in raw_parts if part)
 
-            raise SMSExecutionError(exc.code, raw=merged_raw or None) from exc
+            raise SMSExecutionError(exc.code, raw=merged_raw or None, cms_code=exc.cms_code, cme_code=exc.cme_code) from exc
 
         finally:
             if opened:
