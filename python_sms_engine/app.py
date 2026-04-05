@@ -130,3 +130,40 @@ def debug_modems() -> dict:
     except Exception:
         logger.exception("MODEM_DEBUG_FAILED")
         return {"success": False, "error": "MODEM_DEBUG_FAILED", "modems": []}
+
+
+# ---------------------------------------------------------------------------
+# DEV STUB — Step 9 terminal network-layer failure proof
+# Remove this endpoint before production deployment.
+# ---------------------------------------------------------------------------
+@app.post("/dev/stub/send-network-fail", response_model=SendResponse)
+def dev_stub_network_fail(request: SendRequest) -> SendResponse:
+    """
+    Returns a deterministic terminal network-layer failure response.
+    Does not touch any modem hardware.
+    Use only to prove Step 9: Laravel marks message failed, scheduled_at=null,
+    retry scheduler does not re-queue it.
+    """
+    meta = request.meta or {}
+    message_id = str(meta["message_id"]) if meta.get("message_id") is not None else None
+
+    logger.info(
+        "DEV_STUB_NETWORK_FAIL sim_id=%s message_id=%s",
+        request.sim_id, message_id,
+    )
+
+    return SendResponse(
+        success=False,
+        message_id=message_id,
+        error="SEND_FAILED",
+        raw={
+            "sim_id": request.sim_id,
+            "modem_id": "STUB_MODEM_ID",
+            "port": "/dev/ttyUSB_STUB",
+            "error_layer": "network",
+            "cms_error_code": 27,
+            "cme_error_code": None,
+            "modem_response": "+CMS ERROR: 27",
+            "meta": meta,
+        },
+    )
