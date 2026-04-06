@@ -28,17 +28,39 @@ Default port: `9000`. Configure via `SMS_ENGINE_PORT` env var on the Python side
 
 ---
 
+## Authentication
+
+All Laravel-facing endpoints require a shared secret header. `/health` is intentionally unprotected.
+
+| Item | Value |
+|---|---|
+| Header name | `X-Gateway-Token` |
+| Laravel env key | `SMS_PYTHON_API_TOKEN` |
+| Python env key | `SMS_PYTHON_API_TOKEN` |
+| Unauthorized response | `401 {"success": false, "error": "UNAUTHORIZED"}` |
+| Auth disabled when | `SMS_PYTHON_API_TOKEN` is unset or empty (local dev) |
+
+Laravel must send this header on every protected request:
+```php
+Http::baseUrl(config('sms.python_engine_url'))
+    ->timeout(35)
+    ->withHeaders(['X-Gateway-Token' => config('sms.python_api_token')])
+    ->post('/send', [...]);
+```
+
+---
+
 ## Endpoints
 
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/health` | Service liveness check |
-| `POST` | `/send` | Send an SMS via a specific SIM |
-| `GET` | `/modems/discover` | Force full rescan, return all discovered modems |
-| `GET` | `/modems/available` | Return only SMS-ready modems |
-| `GET` | `/modems/health` | Per-modem health status |
-| `GET` | `/modems/summary` | Count of online/offline modems |
-| `GET` | `/modems/debug` | Full raw modem state dump (debugging only) |
+| Method | Path | Auth required | Purpose |
+|---|---|---|---|
+| `GET` | `/health` | No | Service liveness check |
+| `POST` | `/send` | Yes | Send an SMS via a specific SIM |
+| `GET` | `/modems/discover` | Yes | Force full rescan, return all discovered modems |
+| `GET` | `/modems/available` | Yes | Return only SMS-ready modems |
+| `GET` | `/modems/health` | Yes | Per-modem health status |
+| `GET` | `/modems/summary` | Yes | Count of online/offline modems |
+| `GET` | `/modems/debug` | Yes | Full raw modem state dump (debugging only) |
 
 ---
 
@@ -298,6 +320,7 @@ Quick count for dashboards and monitoring.
 // Base URL from config, timeout slightly above Python's send_timeout (default 30s)
 Http::baseUrl(config('sms.python_engine_url'))
     ->timeout(35)
+    ->withHeaders(['X-Gateway-Token' => config('sms.python_api_token')])
     ->post('/send', [...]);
 ```
 
@@ -373,12 +396,13 @@ $summary = $response->json()['summary'];
 
 1. **Route by `sim_id` (IMSI)** — always send the IMSI string, never a port or ttyUSB number
 2. **Always include `meta.message_id`** — lets you correlate response to your DB record via `response['message_id']`
-3. **Check `error_layer` before deciding to retry** — do not blindly retry `network` errors
-4. **Do not call `/modems/discover` on every send** — it triggers a full hardware scan, use it only for inventory sync
-5. **Use `/modems/available` before batch dispatch** — not on individual sends (registry warm cache handles that)
-6. **Set HTTP timeout to 35s** — Python's default `send_timeout` is 30s; your client must be higher or you'll get false timeouts
-7. **`success: true` means carrier accepted** — it does not mean the recipient received it (carrier delivery receipts are not implemented)
-8. **`modem_id` (IMEI) is the hardware key** — use it in your modem inventory table; `sim_id` (IMSI) is the SIM key
+3. **Always send `X-Gateway-Token`** — all protected endpoints reject without it
+4. **Check `error_layer` before deciding to retry** — do not blindly retry `network` errors
+5. **Do not call `/modems/discover` on every send** — it triggers a full hardware scan, use it only for inventory sync
+6. **Use `/modems/available` before batch dispatch** — not on individual sends (registry warm cache handles that)
+7. **Set HTTP timeout to 35s** — Python's default `send_timeout` is 30s; your client must be higher or you'll get false timeouts
+8. **`success: true` means carrier accepted** — it does not mean the recipient received it (carrier delivery receipts are not implemented)
+9. **`modem_id` (IMEI) is the hardware key** — use it in your modem inventory table; `sim_id` (IMSI) is the SIM key
 
 ---
 
@@ -390,6 +414,7 @@ $summary = $response->json()['summary'];
 | `SMS_ENGINE_COMMAND_TIMEOUT` | `10` | Per-AT-command timeout |
 | `SMS_ENGINE_SEND_TIMEOUT` | `30` | Full send sequence timeout |
 | `SMS_ENGINE_PORT` | `8000` | HTTP port (production uses 9000) |
+| `SMS_PYTHON_API_TOKEN` | `` | Shared secret — auth disabled if unset |
 
 ---
 
@@ -407,5 +432,5 @@ $summary = $response->json()['summary'];
 | `modem_id` in health endpoint | ✅ Confirmed |
 | Fast-fail on network errors | ✅ No wasted retry on carrier reject |
 | Warm registry refresh | ✅ No serial I/O on TTL unless port disappears |
-| API authentication | ❌ Not yet — add shared secret header before production |
-| Per-modem send lock | ❌ Concurrent sends to same modem may collide |
+| API authentication (`X-Gateway-Token`) | ✅ Live-proven — 2026-04-06 |
+| Per-modem send lock | ❌ Concurrent sends to same modem may collide (Task 012B) |

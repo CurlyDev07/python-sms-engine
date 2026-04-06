@@ -211,17 +211,57 @@ Python SMS Engine must remain:
 - hardware-focused
 - easily replaceable
 
-## CURRENT TASK — SMS ENGINE
+## TASK 011 – Laravel Contract Alignment
 
-Status: ✅ STABLE BASE COMPLETE
+Status: ✅ COMPLETE (2026-04-04)
 
-Done:
-- sysfs detection
-- IMSI identity
-- registry optimization
-- retry + fallback
+Goal:
+- Align Python response contracts with Laravel integration needs
 
-Next:
-- Redis queue integration
-- multi-worker sending
-- throughput optimization
+Scope:
+- Echo `meta` in all `/send` response paths
+- Echo `message_id` from `meta.message_id` in top-level response
+- Add `modem_id` to `/modems/health` schema
+- Add typed Pydantic model for `/modems/discover`
+- Write `LARAVEL_INTEGRATION.md`
+
+Result:
+- Laravel↔Python contract proven live end-to-end
+
+---
+
+## TASK 012A – Phase 2 Hardening: Python API Authentication
+
+Status: ✅ COMPLETE (2026-04-06)
+
+Goal:
+- Add shared-secret auth to all Laravel-facing Python endpoints
+
+Scope:
+- Header: `X-Gateway-Token`
+- Env var: `SMS_PYTHON_API_TOKEN`
+- Protected: `/send`, `/modems/discover`, `/modems/health`, `/modems/available`, `/modems/summary`, `/modems/debug`, dev stub
+- Unprotected: `/health` (intentional — liveness probe)
+- Auth disabled when env var unset (local dev safety)
+- 401 response: `{"success": false, "error": "UNAUTHORIZED"}`
+
+Result:
+- Authenticated Laravel→Python→modem flow proven live
+
+---
+
+## TASK 012B – Phase 2 Hardening: Per-Modem Send Lock
+
+Status: 🔲 TODO
+
+Goal:
+- Prevent concurrent send collisions on same modem
+
+Scope:
+- Per sim_id mutex (threading.Lock dict)
+- Acquire lock before serial open, release after close
+- Timeout/fail cleanly if lock cannot be acquired
+- No change to response contract
+
+Result:
+- Pending

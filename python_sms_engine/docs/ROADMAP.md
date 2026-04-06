@@ -96,7 +96,7 @@ Gateway = Control Layer
 Python SMS Engine = Execution Layer  
 Chat App = Intelligence Layer
 
-## Phase: SMS Engine Stabilization ✅
+## Phase 1: SMS Engine Stabilization ✅ COMPLETE
 
 Completed:
 - Sysfs-based modem detection
@@ -104,19 +104,42 @@ Completed:
 - Deterministic port selection (if02)
 - Registry optimization (O(1))
 - Retry + fallback send logic
+- `/send`, `/modems/discover`, `/modems/health`, `/modems/available` endpoints
+- Laravel contract alignment (meta echo, message_id echo, modem_id in health)
+- Typed Pydantic response models for all endpoints
 
 ---
 
-## Next Phase: Scaling 🚀
+## Phase 2: Laravel Integration Hardening 🔄 IN PROGRESS
+
+Completed:
+- Laravel↔Python HTTP contract aligned and live-proven
+- `LARAVEL_INTEGRATION.md` written as authoritative integration contract
+- API authentication via shared secret (`X-Gateway-Token` / `SMS_PYTHON_API_TOKEN`)
+- Authenticated send flow proven end-to-end
+
+Remaining:
+- Per-modem send lock (concurrent send collision prevention)
+
+Phase 2 is NOT locked until per-modem send lock is complete.
+
+---
+
+## Phase 3: Reliability + Observability
+
+Planned:
+- Per-modem send lock (mutex per sim_id)
+- Auto-refresh background thread (re-enable commented code)
+- Signal strength monitoring
+- Modem-level diagnostics
+- Health monitoring improvements
+
+---
+
+## Phase 4+: Scaling
 
 Targets:
 - 100k SMS/day → baseline
 - 500k → Redis queue
 - 1M → worker scaling
 - 5M+ → distributed system
-
-Upcoming:
-- Redis integration
-- Worker queue system
-- Rate limiting per modem
-- Load balancing across modems

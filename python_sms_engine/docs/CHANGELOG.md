@@ -49,3 +49,45 @@
 - unstable identity
 - excessive port scanning
 - unreliable SMS routing
+
+---
+
+## [2026-04-04] – Laravel Contract Alignment (Task 012A)
+
+### Added
+- `meta` echo in all `/send` response paths (success, retry, fallback, failure)
+- `message_id` echo from `meta.message_id` in top-level `SendResponse`
+- `modem_id` (IMEI) field added to `/modems/health` schema and response
+- Typed Pydantic response model for `/modems/discover` (`ModemsDiscoverResponse`)
+- `LARAVEL_INTEGRATION.md` — authoritative Laravel↔Python API contract doc
+
+### Notes
+- Laravel integration proven live: send, discover, health all tested end-to-end
+- Python remains execution-only — no business/retry/queue logic added
+
+---
+
+## [2026-04-06] – Phase 2 Hardening: Python API Authentication
+
+### Added
+- Shared-secret token auth on all Laravel-facing endpoints
+- Header: `X-Gateway-Token`
+- Env var: `SMS_PYTHON_API_TOKEN`
+- Returns `401 {"success": false, "error": "UNAUTHORIZED"}` on missing/wrong token
+- Auth is disabled when `SMS_PYTHON_API_TOKEN` is unset (safe local dev default)
+
+### Protected endpoints
+- `POST /send`
+- `GET /modems/discover`
+- `GET /modems/health`
+- `GET /modems/available`
+- `GET /modems/summary`
+- `GET /modems/debug`
+- `POST /dev/stub/send-network-fail`
+
+### Intentionally unprotected
+- `GET /health` — liveness probe, no data exposed
+
+### Notes
+- Authenticated Laravel→Python→modem flow live-proven
+- Implementation: FastAPI `Depends(_require_token)` per-route, no global middleware
