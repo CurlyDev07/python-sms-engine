@@ -2,7 +2,7 @@ import logging
 import threading
 import time
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 
 from config import settings
 from modem_manager import ModemManager
@@ -17,6 +17,24 @@ logging.basicConfig(
 
 logger = logging.getLogger("python_sms_engine")
 app = FastAPI(title="python_sms_engine")
+
+
+def _require_token(x_gateway_token: str = Header(default="")) -> None:
+    """
+    Shared-secret auth dependency for Laravel-facing endpoints.
+    Header: X-Gateway-Token
+    Env:    SMS_PYTHON_API_TOKEN
+    If env var is empty, auth is disabled (safe for local dev).
+    """
+    expected = settings.engine_token
+    if not expected:
+        return  # auth disabled — no token configured
+    if x_gateway_token != expected:
+        logger.warning("AUTH_FAILED token_provided=%s", bool(x_gateway_token))
+        raise HTTPException(
+            status_code=401,
+            detail={"success": False, "error": "UNAUTHORIZED"},
+        )
 
 
 app.state.modem_registry = ModemRegistry(
@@ -68,7 +86,7 @@ def startup_event() -> None:
     # logger.info("AUTO_REFRESH_THREAD_STARTED")
 
 
-@app.post("/send", response_model=SendResponse)
+@app.post("/send", response_model=SendResponse, dependencies=[Depends(_require_token)])
 def send_sms(request: SendRequest) -> SendResponse:
     service: SmsService = app.state.sms_service
     return service.send(
@@ -84,13 +102,13 @@ def health() -> HealthResponse:
     return HealthResponse(success=True, service="python_sms_engine", status="ok")
 
 
-@app.get("/modems/health", response_model=ModemsHealthResponse)
+@app.get("/modems/health", response_model=ModemsHealthResponse, dependencies=[Depends(_require_token)])
 def modems_health() -> ModemsHealthResponse:
     manager: ModemManager = app.state.modem_manager
     return ModemsHealthResponse(success=True, modems=manager.health())
 
 
-@app.get("/modems/discover", response_model=ModemsDiscoverResponse)
+@app.get("/modems/discover", response_model=ModemsDiscoverResponse, dependencies=[Depends(_require_token)])
 def discover_modems() -> ModemsDiscoverResponse:
     try:
         registry: ModemRegistry = app.state.modem_registry
@@ -102,7 +120,7 @@ def discover_modems() -> ModemsDiscoverResponse:
         return ModemsDiscoverResponse(success=False, modems=[])
 
 
-@app.get("/modems/summary")
+@app.get("/modems/summary", dependencies=[Depends(_require_token)])
 def modems_summary() -> dict:
     try:
         manager: ModemManager = app.state.modem_manager
@@ -112,7 +130,7 @@ def modems_summary() -> dict:
         return {"success": False, "error": "SUMMARY_FAILED", "summary": {}}
 
 
-@app.get("/modems/available")
+@app.get("/modems/available", dependencies=[Depends(_require_token)])
 def available_modems() -> dict:
     try:
         manager: ModemManager = app.state.modem_manager
@@ -122,7 +140,7 @@ def available_modems() -> dict:
         return {"success": False, "error": "AVAILABLE_MODEMS_FAILED", "modems": []}
 
 
-@app.get("/modems/debug")
+@app.get("/modems/debug", dependencies=[Depends(_require_token)])
 def debug_modems() -> dict:
     try:
         manager: ModemManager = app.state.modem_manager
@@ -136,7 +154,7 @@ def debug_modems() -> dict:
 # DEV STUB — Step 9 terminal network-layer failure proof
 # Remove this endpoint before production deployment.
 # ---------------------------------------------------------------------------
-@app.post("/dev/stub/send-network-fail", response_model=SendResponse)
+@app.post("/dev/stub/send-network-fail", response_model=SendResponse, dependencies=[Depends(_require_token)])
 def dev_stub_network_fail(request: SendRequest) -> SendResponse:
     """
     Returns a deterministic terminal network-layer failure response.

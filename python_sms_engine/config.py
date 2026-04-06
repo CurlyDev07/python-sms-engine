@@ -12,6 +12,9 @@ class Settings:
         self.send_timeout = float(os.getenv("SMS_ENGINE_SEND_TIMEOUT", "30"))
         self.host = os.getenv("SMS_ENGINE_HOST", "0.0.0.0")
         self.port = int(os.getenv("SMS_ENGINE_PORT", "8000"))
+        # Shared secret for Laravel↔Python auth.
+        # If empty or unset, auth is disabled (safe for local dev).
+        self.engine_token: str = os.getenv("SMS_PYTHON_API_TOKEN", "")
 
 settings = Settings()
 
