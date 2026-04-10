@@ -247,7 +247,9 @@ Forces a full hardware rescan. All modem probes run in parallel with a hard per-
             "imsi": "515039219149367",
             "iccid": "89630323255005160625",
             "imei": "866358071697796",
-            "probe_error": null
+            "probe_error": null,
+            "send_ready": true,
+            "identifier_source": "imsi"
         }
     ]
 }
@@ -261,19 +263,25 @@ Forces a full hardware rescan. All modem probes run in parallel with a hard per-
     "at_ok": false,
     "sim_ready": false,
     "creg_registered": false,
-    "probe_error": "PROBE_TIMEOUT after 12.0s"
+    "probe_error": "PROBE_TIMEOUT after 12.0s",
+    "send_ready": false,
+    "identifier_source": "fallback_device_id"
 }
 ```
 
 | Field | Description |
 |---|---|
-| `sim_id` | IMSI — use this as the key for `/send`. Falls back to USB physical address if IMSI unavailable. |
+| `sim_id` | Primary SIM identifier used for routing. Source depends on `identifier_source`. |
 | `modem_id` | IMEI — hardware identity, use for inventory tracking |
 | `iccid` | SIM card serial number |
 | `device_id` | USB physical address (sysfs) — stable across reboots |
 | `signal` | Signal strength string from `AT+CSQ` |
 | `creg_registered` | `true` = registered on carrier network |
 | `probe_error` | `null` = healthy. Error string = probe failed or timed out. Inspect per device. |
+| **`send_ready`** | **`true` = this row is safe to use as a `/send` target. Use this directly.** |
+| **`identifier_source`** | **`"imsi"` = `sim_id` is a real telecom IMSI. `"fallback_device_id"` = IMSI unavailable, not a valid SIM identity for routing.** |
+
+**`send_ready` rule:** `true` only when all hold: `probe_error=null`, `at_ok=true`, `sim_ready=true`, `creg_registered=true`, and `identifier_source="imsi"`. If any condition fails, `send_ready=false`.
 
 **Laravel handling of partial results:**
 
@@ -285,19 +293,23 @@ $response = Http::baseUrl($engineUrl)
 $modems = $response->json()['modems'];
 
 foreach ($modems as $modem) {
-    if ($modem['probe_error'] !== null) {
-        // This modem is unhealthy — log and alert, do not use for sending
-        Log::warning('Modem probe failed', [
-            'device_id'   => $modem['device_id'],
-            'port'        => $modem['port'],
-            'probe_error' => $modem['probe_error'],
+    if (! $modem['send_ready']) {
+        // Row is not usable for sending — log and skip
+        // probe_error and identifier_source tell you why
+        Log::warning('Modem not send-ready', [
+            'device_id'         => $modem['device_id'],
+            'port'              => $modem['port'],
+            'probe_error'       => $modem['probe_error'],
+            'identifier_source' => $modem['identifier_source'],
         ]);
         continue;
     }
 
-    if ($modem['at_ok'] && $modem['sim_ready'] && $modem['creg_registered']) {
-        // This modem is ready — update your inventory
-    }
+    // send_ready=true guarantees:
+    //   - probe_error is null
+    //   - at_ok, sim_ready, creg_registered are all true
+    //   - sim_id is a real IMSI (identifier_source="imsi")
+    // Safe to use $modem['sim_id'] as the key for /send
 }
 ```
 
@@ -478,4 +490,6 @@ $summary = $response->json()['summary'];
 | Discovery parallel probing | ✅ All modems probed concurrently — 2026-04-10 |
 | Discovery bounded timeout | ✅ Hard 12s per-modem wall-clock limit — 2026-04-10 |
 | Partial discovery results | ✅ `probe_error` per modem, one bad modem does not block others — 2026-04-10 |
+| `send_ready` field | ✅ Explicit send-readiness flag per modem row — 2026-04-10 |
+| `identifier_source` field | ✅ Explicit SIM identity source (`"imsi"` vs `"fallback_device_id"`) — 2026-04-10 |
 | Per-modem send lock | ❌ Concurrent sends to same modem may collide (Task 012B) |

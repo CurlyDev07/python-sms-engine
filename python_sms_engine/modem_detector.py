@@ -398,6 +398,22 @@ def discover_all_modems(
         physical = probe.pop("physical", None) or probe.get("port", "unknown")
         sim_id = _select_sim_id(probe) or physical  # physical address as last-resort identity
 
+        # identifier_source: "imsi" only when a real telecom SIM identity was read.
+        # Anything else (ICCID-only, IMEI-only, or physical USB address fallback)
+        # means the sim_id is not a trustworthy SIM identifier for routing.
+        imsi = probe.get("imsi")
+        identifier_source = "imsi" if imsi else "fallback_device_id"
+
+        # send_ready: true only when the modem row is safe to use as a /send target.
+        # All five conditions must hold — a partial pass is not send-safe.
+        send_ready = bool(
+            not probe.get("probe_error")
+            and probe.get("at_ok")
+            and probe.get("sim_ready")
+            and probe.get("creg_registered")
+            and identifier_source == "imsi"
+        )
+
         modems.append({
             "sim_id":           str(sim_id),
             "modem_id":         probe.get("imei"),
@@ -413,6 +429,8 @@ def discover_all_modems(
             "iccid":            probe.get("iccid"),
             "imei":             probe.get("imei"),
             "probe_error":      probe.get("probe_error"),
+            "send_ready":       send_ready,
+            "identifier_source": identifier_source,
         })
 
     return modems

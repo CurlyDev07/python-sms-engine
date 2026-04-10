@@ -136,7 +136,9 @@ Returns **all** detected modem ports — including unhealthy and timed-out ones.
             "imsi": "515039219149367",
             "iccid": "89630323255005160625",
             "imei": "866358071697796",
-            "probe_error": null
+            "probe_error": null,
+            "send_ready": true,
+            "identifier_source": "imsi"
         }
     ]
 }
@@ -161,7 +163,9 @@ Returns **all** detected modem ports — including unhealthy and timed-out ones.
             "imsi": null,
             "iccid": null,
             "imei": null,
-            "probe_error": "PROBE_TIMEOUT after 12.0s"
+            "probe_error": "PROBE_TIMEOUT after 12.0s",
+            "send_ready": false,
+            "identifier_source": "fallback_device_id"
         }
     ]
 }
@@ -169,7 +173,7 @@ Returns **all** detected modem ports — including unhealthy and timed-out ones.
 
 | Field | Description |
 |---|---|
-| `sim_id` | IMSI — used to route SMS requests. Falls back to USB physical address if IMSI unavailable |
+| `sim_id` | Primary SIM identifier. Source depends on `identifier_source`. |
 | `modem_id` | IMEI — hardware identity, stays with device |
 | `device_id` | USB physical address (sysfs) |
 | `port` | Primary serial port (if02) |
@@ -179,8 +183,10 @@ Returns **all** detected modem ports — including unhealthy and timed-out ones.
 | `sim_ready` | `true` = SIM inserted and readable |
 | `creg_registered` | `true` = registered on carrier network |
 | `probe_error` | `null` = healthy. Error string = probe failed or timed out. Inspect per device. |
+| **`send_ready`** | **`true` = this row is safe to use as a `/send` target. Use this directly.** |
+| **`identifier_source`** | **`"imsi"` = `sim_id` is a real telecom IMSI. `"fallback_device_id"` = not a SIM identity, do not use for sends.** |
 
-**Partial results are expected behavior.** If some modems return `probe_error`, debug those devices individually — the response will still contain all other modems correctly.
+**Partial results are expected behavior.** Use `send_ready` to filter usable rows. Rows with `send_ready=false` need hardware attention but do not affect other rows in the response.
 
 ---
 

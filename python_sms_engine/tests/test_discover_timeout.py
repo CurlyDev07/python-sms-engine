@@ -285,3 +285,179 @@ class TestDiscoverAllModems:
         # Should complete within probe_timeout + 2s overhead (thread pool teardown)
         assert elapsed < probe_timeout + 2.0, f"Expected < {probe_timeout + 2.0:.1f}s, got {elapsed:.2f}s"
         assert all("PROBE_TIMEOUT" in r.get("probe_error", "") for r in results)
+
+
+# ---------------------------------------------------------------------------
+# Contract-hardening: send_ready + identifier_source
+# ---------------------------------------------------------------------------
+
+class TestContractHardeningFields:
+    """
+    Tests for the two contract-hardening fields added to /modems/discover responses:
+      - send_ready: bool
+      - identifier_source: "imsi" | "fallback_device_id"
+
+    Rules under test:
+      - send_ready=True requires: no probe_error, at_ok, sim_ready, creg_registered,
+        and identifier_source=="imsi"
+      - identifier_source="imsi" only when probe.imsi is not None
+      - identifier_source="fallback_device_id" for all other cases (ICCID-only, IMEI-only,
+        or physical USB address fallback when probe timed out)
+    """
+
+    def _probe_with_imsi(self, physical, port, fallback):
+        """Healthy probe result with IMSI present."""
+        return _healthy_probe_result(physical, port, fallback)
+
+    def _probe_no_imsi_but_iccid(self, physical, port, fallback):
+        """Probe succeeded but AT+CIMI failed — ICCID available, no IMSI."""
+        base = _healthy_probe_result(physical, port, fallback)
+        base["imsi"] = None  # IMSI read failed
+        base["iccid"] = "89630323255005160625"
+        return base
+
+    def _probe_timed_out(self, physical, port, fallback):
+        """Probe timed out — no identity at all, all flags false."""
+        return {
+            "physical": physical,
+            "port": port,
+            "fallback_port": fallback,
+            "at_ok": False,
+            "sim_ready": False,
+            "creg_registered": False,
+            "signal": None,
+            "imsi": None,
+            "iccid": None,
+            "imei": None,
+            "score": 0,
+            "probe_error": "PROBE_TIMEOUT after 12.0s",
+        }
+
+    def test_healthy_modem_with_imsi_is_send_ready(self):
+        """Fully healthy modem with IMSI: send_ready=True, identifier_source="imsi"."""
+        entries = [("3-7.4.4", "/dev/ttyUSB2", "/dev/ttyUSB3")]
+
+        def fake_safe_probe(physical, primary_port, fallback_port, *args, **kwargs):
+            return self._probe_with_imsi(physical, primary_port, fallback_port)
+
+        with patch("modem_detector._collect_if02_ports", return_value=entries):
+            with patch("modem_detector._safe_probe", side_effect=fake_safe_probe):
+                results = discover_all_modems(probe_timeout=5.0)
+
+        assert len(results) == 1
+        r = results[0]
+        assert r["send_ready"] is True
+        assert r["identifier_source"] == "imsi"
+        assert r["probe_error"] is None
+
+    def test_timed_out_probe_is_not_send_ready(self):
+        """Timed-out probe: send_ready=False, identifier_source="fallback_device_id"."""
+        entries = [("3-7.4.4", "/dev/ttyUSB2", "/dev/ttyUSB3")]
+
+        def fake_safe_probe(*args, **kwargs):
+            time.sleep(9999)  # hang indefinitely
+
+        with patch("modem_detector._collect_if02_ports", return_value=entries):
+            with patch("modem_detector._safe_probe", side_effect=fake_safe_probe):
+                results = discover_all_modems(probe_timeout=0.5)
+
+        assert len(results) == 1
+        r = results[0]
+        assert r["send_ready"] is False
+        assert r["identifier_source"] == "fallback_device_id"
+        assert "PROBE_TIMEOUT" in r["probe_error"]
+
+    def test_port_not_found_is_not_send_ready(self):
+        """Missing port: send_ready=False, identifier_source="fallback_device_id"."""
+        entries = [("3-7.4.4", "/dev/ttyUSB_GONE", None)]
+
+        def fake_safe_probe(physical, primary_port, fallback_port, *args, **kwargs):
+            return {
+                "physical": physical,
+                "port": primary_port,
+                "fallback_port": fallback_port,
+                "at_ok": False, "sim_ready": False, "creg_registered": False,
+                "signal": None, "imsi": None, "iccid": None, "imei": None,
+                "score": 0, "probe_error": "PORT_NOT_FOUND",
+            }
+
+        with patch("modem_detector._collect_if02_ports", return_value=entries):
+            with patch("modem_detector._safe_probe", side_effect=fake_safe_probe):
+                results = discover_all_modems(probe_timeout=5.0)
+
+        assert len(results) == 1
+        r = results[0]
+        assert r["send_ready"] is False
+        assert r["identifier_source"] == "fallback_device_id"
+        assert r["probe_error"] == "PORT_NOT_FOUND"
+
+    def test_healthy_flags_but_no_imsi_is_not_send_ready(self):
+        """
+        Modem passes at_ok/sim_ready/creg but IMSI was not readable.
+        identifier_source="fallback_device_id", send_ready=False.
+        """
+        entries = [("3-7.4.4", "/dev/ttyUSB2", "/dev/ttyUSB3")]
+
+        def fake_safe_probe(physical, primary_port, fallback_port, *args, **kwargs):
+            return self._probe_no_imsi_but_iccid(physical, primary_port, fallback_port)
+
+        with patch("modem_detector._collect_if02_ports", return_value=entries):
+            with patch("modem_detector._safe_probe", side_effect=fake_safe_probe):
+                results = discover_all_modems(probe_timeout=5.0)
+
+        assert len(results) == 1
+        r = results[0]
+        assert r["send_ready"] is False
+        assert r["identifier_source"] == "fallback_device_id"
+        # Other flags may still be True — this tests the identifier_source rule specifically
+        assert r["at_ok"] is True
+        assert r["sim_ready"] is True
+
+    def test_partial_discovery_returns_mixed_healthy_and_failed(self):
+        """
+        Mixed discovery: healthy modem is send_ready, failed modem is not.
+        Both are present in the same response.
+        """
+        entries = [
+            ("3-7.1", "/dev/ttyUSB0", "/dev/ttyUSB1"),  # healthy
+            ("3-7.2", "/dev/ttyUSB2", "/dev/ttyUSB3"),  # timed out
+        ]
+        hang_port = "/dev/ttyUSB2"
+
+        def fake_safe_probe(physical, primary_port, fallback_port, *args, **kwargs):
+            if primary_port == hang_port:
+                return self._probe_timed_out(physical, primary_port, fallback_port)
+            return self._probe_with_imsi(physical, primary_port, fallback_port)
+
+        with patch("modem_detector._collect_if02_ports", return_value=entries):
+            with patch("modem_detector._safe_probe", side_effect=fake_safe_probe):
+                results = discover_all_modems(probe_timeout=5.0)
+
+        assert len(results) == 2
+
+        send_ready_rows = [r for r in results if r["send_ready"]]
+        not_ready_rows = [r for r in results if not r["send_ready"]]
+
+        assert len(send_ready_rows) == 1
+        assert len(not_ready_rows) == 1
+
+        assert send_ready_rows[0]["identifier_source"] == "imsi"
+        assert not_ready_rows[0]["identifier_source"] == "fallback_device_id"
+
+    def test_send_ready_false_when_creg_not_registered(self):
+        """Modem with IMSI but not registered on carrier: send_ready=False."""
+        entries = [("3-7.4.4", "/dev/ttyUSB2", "/dev/ttyUSB3")]
+
+        def fake_safe_probe(physical, primary_port, fallback_port, *args, **kwargs):
+            probe = self._probe_with_imsi(physical, primary_port, fallback_port)
+            probe["creg_registered"] = False  # not registered on network
+            return probe
+
+        with patch("modem_detector._collect_if02_ports", return_value=entries):
+            with patch("modem_detector._safe_probe", side_effect=fake_safe_probe):
+                results = discover_all_modems(probe_timeout=5.0)
+
+        assert len(results) == 1
+        r = results[0]
+        assert r["send_ready"] is False
+        assert r["identifier_source"] == "imsi"  # identifier_source independent of creg

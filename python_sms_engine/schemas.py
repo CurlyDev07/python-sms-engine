@@ -50,6 +50,10 @@ class ModemDiscoverItem(BaseModel):
     iccid: Optional[str] = None
     imei: Optional[str] = None
     probe_error: Optional[str] = None
+    # Contract-hardening fields — explicit send-readiness and identity source.
+    # Consumers should use these instead of re-deriving from individual flag fields.
+    send_ready: bool = False
+    identifier_source: str = "fallback_device_id"
 
 
 class ModemsDiscoverResponse(BaseModel):

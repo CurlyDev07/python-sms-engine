@@ -67,6 +67,23 @@
 
 ---
 
+## [2026-04-10] – Discovery Contract Hardening: send_ready + identifier_source
+
+### Added
+- `send_ready` field on every `/modems/discover` modem row — explicit boolean telling consumers whether the row is safe to use as a `/send` target
+- `identifier_source` field on every `/modems/discover` modem row — string enum telling consumers whether `sim_id` is a real telecom SIM identity or a fallback device identifier:
+  - `"imsi"` — IMSI was successfully read from the SIM via `AT+CIMI`
+  - `"fallback_device_id"` — IMSI was unavailable; `sim_id` fell back to ICCID, IMEI, or USB physical address
+- `send_ready=True` only when all five conditions hold: `probe_error=null`, `at_ok=true`, `sim_ready=true`, `creg_registered=true`, and `identifier_source="imsi"`
+- All existing fields preserved — fully backward-compatible, additive only
+
+### Notes
+- Consumers (e.g. Laravel) should use `send_ready` directly instead of re-deriving from individual flag combinations
+- `identifier_source` makes explicit what was previously implicit — `sim_id` can be a fallback device identifier for unhealthy rows; that identifier is not safe for routing
+- `detect_modems()` (startup/warm-cache path) is unchanged — it already filters to healthy-only
+
+---
+
 ## [2026-04-10] – Discovery Timeout Fix: Parallel Probing + Bounded Timeout
 
 ### Fixed

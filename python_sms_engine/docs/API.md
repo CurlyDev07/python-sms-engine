@@ -255,7 +255,9 @@ X-Gateway-Token: <your-token>
             "imsi": "515039219149367",
             "iccid": "89630323255005160625",
             "imei": "866358071697796",
-            "probe_error": null
+            "probe_error": null,
+            "send_ready": true,
+            "identifier_source": "imsi"
         }
     ]
 }
@@ -277,13 +279,15 @@ X-Gateway-Token: <your-token>
     "imsi": null,
     "iccid": null,
     "imei": null,
-    "probe_error": "PROBE_TIMEOUT after 12.0s"
+    "probe_error": "PROBE_TIMEOUT after 12.0s",
+    "send_ready": false,
+    "identifier_source": "fallback_device_id"
 }
 ```
 
 | Field | Description |
 |---|---|
-| `sim_id` | IMSI — use this as the key for `/send`. Falls back to USB physical address if IMSI unavailable. |
+| `sim_id` | Primary SIM identifier used for routing. Source depends on `identifier_source`. |
 | `modem_id` | IMEI — hardware identity, use for inventory tracking |
 | `iccid` | Physical SIM card serial number |
 | `device_id` | USB physical address (sysfs) — stable across reboots |
@@ -294,6 +298,8 @@ X-Gateway-Token: <your-token>
 | `creg_registered` | `true` = registered on carrier network |
 | `signal` | Signal strength string from `AT+CSQ` |
 | `probe_error` | `null` = healthy. Error string = probe failed or timed out. Common values below. |
+| **`send_ready`** | **`true` = this row is safe to use as a `/send` target. Use this field directly instead of re-deriving from flags.** |
+| **`identifier_source`** | **`"imsi"` = `sim_id` is a real telecom IMSI. `"fallback_device_id"` = IMSI unavailable, `sim_id` is a non-telecom fallback identifier. Never route sends using fallback rows.** |
 
 **`probe_error` values:**
 
