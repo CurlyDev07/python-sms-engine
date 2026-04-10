@@ -2,11 +2,17 @@ import glob
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from typing import Dict, List, Optional, Tuple
 
 from at_client import ModemATClient
 
 QUECTEL_VENDOR_ID = "2c7c"
+
+# Hard wall-clock limit per modem probe. One stuck modem will not block others
+# past this deadline — it gets marked as PROBE_TIMEOUT and the caller moves on.
+# The underlying thread may remain blocked in I/O, but the response is unaffected.
+PROBE_TIMEOUT_S = 12.0
 
 
 def _extract_signal(raw: str) -> Optional[str]:
@@ -56,7 +62,7 @@ def _cmd_expect_ok(client: ModemATClient, command: str, timeout: float) -> str:
     )
 
 
-def _wait_for_cpin_ready(client: ModemATClient, timeout: float = 4.0) -> bool:
+def _wait_for_cpin_ready(client: ModemATClient, timeout: float = 3.0) -> bool:
     start = time.monotonic()
     while time.monotonic() - start < timeout:
         try:
@@ -75,7 +81,7 @@ def _wait_for_cpin_ready(client: ModemATClient, timeout: float = 4.0) -> bool:
     return False
 
 
-def _wait_for_creg(client: ModemATClient, timeout: float = 4.0) -> bool:
+def _wait_for_creg(client: ModemATClient, timeout: float = 3.0) -> bool:
     start = time.monotonic()
     while time.monotonic() - start < timeout:
         try:
@@ -95,7 +101,7 @@ def _wait_for_creg(client: ModemATClient, timeout: float = 4.0) -> bool:
 
 
 def _get_identity(
-    client: ModemATClient, timeout: float = 2.0
+    client: ModemATClient, timeout: float = 1.5
 ) -> Dict[str, Optional[str]]:
     data: Dict[str, Optional[str]] = {"imsi": None, "iccid": None, "imei": None}
 
@@ -181,12 +187,12 @@ def _probe_port(port: str, serial_timeout: float, command_timeout: float) -> Dic
         result.update(identity)
 
         score = 0
-        if result["at_ok"]:        score += 1
-        if result["imei"]:         score += 2
-        if result["sim_ready"]:    score += 4
-        if result["creg_registered"]: score += 4
-        if result["imsi"]:         score += 3
-        if result["iccid"]:        score += 3
+        if result["at_ok"]:             score += 1
+        if result["imei"]:              score += 2
+        if result["sim_ready"]:         score += 4
+        if result["creg_registered"]:   score += 4
+        if result["imsi"]:              score += 3
+        if result["iccid"]:             score += 3
         result["score"] = score
 
         return result
@@ -194,6 +200,42 @@ def _probe_port(port: str, serial_timeout: float, command_timeout: float) -> Dic
     finally:
         if opened:
             client.close()
+
+
+def _safe_probe(
+    physical: str,
+    primary_port: str,
+    fallback_port: Optional[str],
+    serial_timeout: float,
+    command_timeout: float,
+) -> Dict:
+    """
+    Wraps _probe_port and normalises all outcomes (exception, missing port)
+    into a consistent result dict. Never raises.
+    """
+    base: Dict = {
+        "physical": physical,
+        "port": primary_port,
+        "fallback_port": fallback_port,
+        "at_ok": False,
+        "sim_ready": False,
+        "creg_registered": False,
+        "signal": None,
+        "imsi": None,
+        "iccid": None,
+        "imei": None,
+        "score": 0,
+        "probe_error": None,
+    }
+    if not os.path.exists(primary_port):
+        base["probe_error"] = "PORT_NOT_FOUND"
+        return base
+    try:
+        result = _probe_port(primary_port, serial_timeout, command_timeout)
+        base.update(result)
+    except Exception as exc:
+        base["probe_error"] = str(exc)
+    return base
 
 
 def _read_sysfs_attr(path: str) -> Optional[str]:
@@ -223,9 +265,6 @@ def _sysfs_ttyusb_info(ttyusb_name: str) -> Optional[Tuple[str, int, str]]:
     if not m:
         return None
 
-    # group(1) ends with "/" after the physical device dir, e.g. ".../3-7.4/"
-    # group(2) is the physical device component, e.g. "3-7.4.4"
-    # So device_sysfs = group(1) stripped of its trailing slash
     device_sysfs = m.group(1).rstrip("/")
     physical = m.group(2)
     interface_num = int(m.group(4))
@@ -281,42 +320,143 @@ def _select_sim_id(item: Dict) -> Optional[str]:
     return item.get("imsi") or item.get("iccid") or item.get("imei")
 
 
-def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> List[Dict]:
+def _run_parallel_probes(
+    entries: List[Tuple[str, str, Optional[str]]],
+    serial_timeout: float,
+    command_timeout: float,
+    probe_timeout: float,
+) -> List[Dict]:
+    """
+    Probes all modem entries in parallel using a thread pool.
+
+    Each probe is bounded by probe_timeout seconds wall-clock. Modems that
+    do not finish within the deadline are marked probe_error=PROBE_TIMEOUT
+    and included in results — they do not block the remaining results.
+
+    Returns one result dict per entry (including timed-out/failed ones).
+    """
+    if not entries:
+        return []
+
+    results: List[Dict] = []
+
+    with ThreadPoolExecutor(max_workers=len(entries)) as executor:
+        future_to_meta = {
+            executor.submit(
+                _safe_probe, physical, port, fallback, serial_timeout, command_timeout
+            ): (physical, port, fallback)
+            for physical, port, fallback in entries
+        }
+
+        done, not_done = futures_wait(future_to_meta, timeout=probe_timeout)
+
+        for f in done:
+            results.append(f.result())
+
+        for f in not_done:
+            physical, port, fallback = future_to_meta[f]
+            print(f"[TIMEOUT] {physical} -> probe timed out after {probe_timeout}s")
+            results.append({
+                "physical": physical,
+                "port": port,
+                "fallback_port": fallback,
+                "at_ok": False,
+                "sim_ready": False,
+                "creg_registered": False,
+                "signal": None,
+                "imsi": None,
+                "iccid": None,
+                "imei": None,
+                "score": 0,
+                "probe_error": f"PROBE_TIMEOUT after {probe_timeout}s",
+            })
+            f.cancel()  # best-effort; stuck thread will eventually unblock on its own
+
+    return results
+
+
+def discover_all_modems(
+    serial_timeout: float = 3.0,
+    command_timeout: float = 5.0,
+    probe_timeout: float = PROBE_TIMEOUT_S,
+) -> List[Dict]:
+    """
+    Discovers all Quectel modem ports via sysfs and probes them in parallel.
+
+    Unlike detect_modems(), this returns ALL detected ports including unhealthy
+    and timed-out ones, each with a clear probe_error field. Use this for the
+    /modems/discover endpoint so callers see the full hardware picture even when
+    some modems are in a bad state.
+
+    Guaranteed to return within probe_timeout + sysfs scan time (~1s).
+    """
+    entries = _collect_if02_ports()
+    raw_results = _run_parallel_probes(entries, serial_timeout, command_timeout, probe_timeout)
+
+    modems: List[Dict] = []
+    for probe in raw_results:
+        physical = probe.pop("physical", None) or probe.get("port", "unknown")
+        sim_id = _select_sim_id(probe) or physical  # physical address as last-resort identity
+
+        modems.append({
+            "sim_id":           str(sim_id),
+            "modem_id":         probe.get("imei"),
+            "device_id":        physical,
+            "port":             probe.get("port"),
+            "fallback_port":    probe.get("fallback_port"),
+            "interface":        "if02",
+            "at_ok":            bool(probe.get("at_ok")),
+            "sim_ready":        bool(probe.get("sim_ready")),
+            "creg_registered":  bool(probe.get("creg_registered")),
+            "signal":           probe.get("signal"),
+            "imsi":             probe.get("imsi"),
+            "iccid":            probe.get("iccid"),
+            "imei":             probe.get("imei"),
+            "probe_error":      probe.get("probe_error"),
+        })
+
+    return modems
+
+
+def detect_modems(
+    serial_timeout: float = 3.0,
+    command_timeout: float = 5.0,
+    probe_timeout: float = PROBE_TIMEOUT_S,
+) -> List[Dict]:
     """
     Discovers ready Quectel modems via sysfs USB topology.
 
     Strategy:
       - Enumerate only if=2 ports (one per physical modem).
-      - Probe only if=2. if=3 is stored as fallback_port, never probed here.
-      - A modem is accepted only when: at_ok + sim_ready + creg_registered.
+      - Probe all ports in parallel — bounded by probe_timeout.
+      - Return only modems that pass: at_ok + sim_ready + creg_registered.
       - sim_id  = IMSI (preferred) → ICCID → IMEI
       - modem_id = IMEI (hardware identity, separate from SIM identity)
 
-    N modems = exactly N probes (worst case). No if=3 probing at startup.
+    N modems = N probes running concurrently (not sequentially).
+    One hung modem does not delay the rest.
     """
     entries = _collect_if02_ports()
+    raw_results = _run_parallel_probes(entries, serial_timeout, command_timeout, probe_timeout)
+
     modems: List[Dict] = []
+    for probe in raw_results:
+        physical = probe.pop("physical", None) or probe.get("port", "unknown")
 
-    for physical, primary_port, fallback_port in entries:
-        print(f"[PROBE] {physical} -> {primary_port} (fallback: {fallback_port})")
-
-        if not os.path.exists(primary_port):
-            print(f"[SKIP] {physical} -> port gone")
-            continue
-
-        try:
-            probe = _probe_port(primary_port, serial_timeout, command_timeout)
-        except Exception as exc:
-            print(f"[SKIP] {physical} -> probe failed ({exc})")
+        if probe.get("probe_error"):
+            print(f"[SKIP] {physical} -> probe error: {probe['probe_error']}")
             continue
 
         print(
-            f"[TRY] {physical} if02={primary_port} "
+            f"[TRY] {physical} if02={probe.get('port')} "
             f"score={probe['score']} sim_ready={probe['sim_ready']} creg={probe['creg_registered']}"
         )
 
         if not (probe["at_ok"] and probe["sim_ready"] and probe["creg_registered"]):
-            print(f"[SKIP] {physical} -> if02 not ready (sim_ready={probe['sim_ready']} creg={probe['creg_registered']})")
+            print(
+                f"[SKIP] {physical} -> if02 not ready "
+                f"(sim_ready={probe['sim_ready']} creg={probe['creg_registered']})"
+            )
             continue
 
         sim_id = _select_sim_id(probe)
@@ -324,25 +464,23 @@ def detect_modems(serial_timeout: float = 3.0, command_timeout: float = 5.0) -> 
             print(f"[SKIP] {physical} -> no SIM identity (IMSI/ICCID/IMEI all missing)")
             continue
 
-        modems.append(
-            {
-                "sim_id":       str(sim_id),
-                "modem_id":     probe.get("imei"),   # IMEI = hardware identity
-                "device_id":    physical,
-                "port":         primary_port,
-                "fallback_port": fallback_port,       # if03, stored but not probed
-                "interface":    "if02",
-                "at_ok":        probe["at_ok"],
-                "sim_ready":    probe["sim_ready"],
-                "creg_registered": probe["creg_registered"],
-                "signal":       probe["signal"],
-                "imsi":         probe["imsi"],
-                "iccid":        probe["iccid"],
-                "imei":         probe["imei"],
-            }
-        )
+        modems.append({
+            "sim_id":           str(sim_id),
+            "modem_id":         probe.get("imei"),
+            "device_id":        physical,
+            "port":             probe.get("port"),
+            "fallback_port":    probe.get("fallback_port"),
+            "interface":        "if02",
+            "at_ok":            probe["at_ok"],
+            "sim_ready":        probe["sim_ready"],
+            "creg_registered":  probe["creg_registered"],
+            "signal":           probe["signal"],
+            "imsi":             probe["imsi"],
+            "iccid":            probe["iccid"],
+            "imei":             probe["imei"],
+        })
         print(
-            f"[SELECTED] {physical} -> {primary_port} "
+            f"[SELECTED] {physical} -> {probe.get('port')} "
             f"sim_id={sim_id} modem_id={probe.get('imei')}"
         )
 

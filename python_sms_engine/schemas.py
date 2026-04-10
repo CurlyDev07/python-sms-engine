@@ -49,6 +49,7 @@ class ModemDiscoverItem(BaseModel):
     imsi: Optional[str] = None
     iccid: Optional[str] = None
     imei: Optional[str] = None
+    probe_error: Optional[str] = None
 
 
 class ModemsDiscoverResponse(BaseModel):

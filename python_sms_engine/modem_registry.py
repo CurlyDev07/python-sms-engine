@@ -3,7 +3,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from modem_detector import detect_modems
+from modem_detector import PROBE_TIMEOUT_S, detect_modems, discover_all_modems
 
 
 class ModemRegistry:
@@ -79,6 +79,37 @@ class ModemRegistry:
             print(f"[REGISTRY] Loaded {len(self._cache)} modems")
 
             return self._cache
+
+    def discover(self, probe_timeout: float = PROBE_TIMEOUT_S) -> List[Dict[str, Any]]:
+        """
+        Probes all modems in parallel and returns ALL results including unhealthy
+        and timed-out ones (each has probe_error field set when something went wrong).
+
+        Also updates the routing cache with any healthy modems found so that
+        subsequent /send calls benefit from the fresh state.
+
+        Bounded by probe_timeout — never hangs the caller.
+        """
+        all_probed = discover_all_modems(
+            serial_timeout=self.serial_timeout,
+            command_timeout=self.command_timeout,
+            probe_timeout=probe_timeout,
+        )
+
+        # Update routing cache with healthy modems found in this scan
+        new_cache: Dict[str, Dict[str, Any]] = {}
+        for modem in all_probed:
+            if modem.get("at_ok") and modem.get("sim_ready") and modem.get("creg_registered"):
+                sim_id = modem.get("sim_id")
+                if sim_id:
+                    new_cache[str(sim_id)] = modem
+
+        with self._refresh_lock:
+            self._cache = new_cache
+            self._last_refresh = time.monotonic()
+
+        print(f"[REGISTRY] discover() found {len(all_probed)} ports, {len(new_cache)} healthy")
+        return all_probed
 
     def get_all(self) -> List[Dict[str, Any]]:
         self.refresh()

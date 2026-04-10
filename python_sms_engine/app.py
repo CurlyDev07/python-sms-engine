@@ -110,10 +110,15 @@ def modems_health() -> ModemsHealthResponse:
 
 @app.get("/modems/discover", response_model=ModemsDiscoverResponse, dependencies=[Depends(_require_token)])
 def discover_modems() -> ModemsDiscoverResponse:
+    """
+    Forces a full hardware rescan. Probes all modems in parallel with a hard
+    per-modem timeout so one stuck port never hangs the whole response.
+    Returns ALL detected ports, including unhealthy/timed-out ones with
+    probe_error set.
+    """
     try:
         registry: ModemRegistry = app.state.modem_registry
-        registry.refresh(force=True)
-        modems = registry.get_all()
+        modems = registry.discover()
         return ModemsDiscoverResponse(success=True, modems=modems)
     except Exception:
         logger.exception("MODEM_DISCOVERY_FAILED")
