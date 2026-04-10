@@ -220,13 +220,15 @@ Send an SMS message through a specific SIM (identified by IMSI).
 
 ## `GET /modems/discover`
 
-Forces a full hardware rescan. Probes all USB ports via sysfs. Takes ~2–5 seconds.
+Forces a full hardware rescan. All modem probes run in parallel with a hard per-modem timeout (12s). The endpoint always returns within ~15s regardless of hardware state — it does not hang.
 
 **Use when:** Modem was just plugged in, after server restart, or to refresh the full modem inventory.
 
 **Do not call on every send request** — the registry has a warm cache that handles routine lookups.
 
-**Response:**
+**Partial results are expected behavior.** The response includes ALL detected ports, including unhealthy and timed-out ones. A response where some modems have `probe_error` set is not a failure — it means those specific devices need attention. Healthy modems in the same response are usable.
+
+**Response (healthy modem):**
 ```json
 {
     "success": true,
@@ -244,20 +246,60 @@ Forces a full hardware rescan. Probes all USB ports via sysfs. Takes ~2–5 seco
             "signal": "+CSQ: 20,99",
             "imsi": "515039219149367",
             "iccid": "89630323255005160625",
-            "imei": "866358071697796"
+            "imei": "866358071697796",
+            "probe_error": null
         }
     ]
 }
 ```
 
+**Failed/timed-out modem (in same response as healthy ones):**
+```json
+{
+    "sim_id": "3-7.2.4",
+    "modem_id": null,
+    "at_ok": false,
+    "sim_ready": false,
+    "creg_registered": false,
+    "probe_error": "PROBE_TIMEOUT after 12.0s"
+}
+```
+
 | Field | Description |
 |---|---|
-| `sim_id` | IMSI — use this as the key for `/send` |
+| `sim_id` | IMSI — use this as the key for `/send`. Falls back to USB physical address if IMSI unavailable. |
 | `modem_id` | IMEI — hardware identity, use for inventory tracking |
 | `iccid` | SIM card serial number |
 | `device_id` | USB physical address (sysfs) — stable across reboots |
 | `signal` | Signal strength string from `AT+CSQ` |
 | `creg_registered` | `true` = registered on carrier network |
+| `probe_error` | `null` = healthy. Error string = probe failed or timed out. Inspect per device. |
+
+**Laravel handling of partial results:**
+
+```php
+$response = Http::baseUrl($engineUrl)
+    ->withHeaders(['X-Gateway-Token' => config('sms.python_api_token')])
+    ->get('/modems/discover');
+
+$modems = $response->json()['modems'];
+
+foreach ($modems as $modem) {
+    if ($modem['probe_error'] !== null) {
+        // This modem is unhealthy — log and alert, do not use for sending
+        Log::warning('Modem probe failed', [
+            'device_id'   => $modem['device_id'],
+            'port'        => $modem['port'],
+            'probe_error' => $modem['probe_error'],
+        ]);
+        continue;
+    }
+
+    if ($modem['at_ok'] && $modem['sim_ready'] && $modem['creg_registered']) {
+        // This modem is ready — update your inventory
+    }
+}
+```
 
 ---
 
@@ -398,7 +440,7 @@ $summary = $response->json()['summary'];
 2. **Always include `meta.message_id`** — lets you correlate response to your DB record via `response['message_id']`
 3. **Always send `X-Gateway-Token`** — all protected endpoints reject without it
 4. **Check `error_layer` before deciding to retry** — do not blindly retry `network` errors
-5. **Do not call `/modems/discover` on every send** — it triggers a full hardware scan, use it only for inventory sync
+5. **Do not call `/modems/discover` on every send** — it triggers a full parallel hardware scan; use it only for inventory sync or after hardware changes
 6. **Use `/modems/available` before batch dispatch** — not on individual sends (registry warm cache handles that)
 7. **Set HTTP timeout to 35s** — Python's default `send_timeout` is 30s; your client must be higher or you'll get false timeouts
 8. **`success: true` means carrier accepted** — it does not mean the recipient received it (carrier delivery receipts are not implemented)
@@ -433,4 +475,7 @@ $summary = $response->json()['summary'];
 | Fast-fail on network errors | ✅ No wasted retry on carrier reject |
 | Warm registry refresh | ✅ No serial I/O on TTL unless port disappears |
 | API authentication (`X-Gateway-Token`) | ✅ Live-proven — 2026-04-06 |
+| Discovery parallel probing | ✅ All modems probed concurrently — 2026-04-10 |
+| Discovery bounded timeout | ✅ Hard 12s per-modem wall-clock limit — 2026-04-10 |
+| Partial discovery results | ✅ `probe_error` per modem, one bad modem does not block others — 2026-04-10 |
 | Per-modem send lock | ❌ Concurrent sends to same modem may collide (Task 012B) |

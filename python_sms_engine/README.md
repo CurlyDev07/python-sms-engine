@@ -112,8 +112,12 @@ curl -s http://127.0.0.1:9000/health | python3 -m json.tool
 
 ### Discover modems (force full rescan)
 ```bash
-curl -s http://127.0.0.1:9000/modems/discover | python3 -m json.tool
+curl -s -H "X-Gateway-Token: <token>" http://127.0.0.1:9000/modems/discover | python3 -m json.tool
 ```
+
+Returns **all** detected modem ports — including unhealthy and timed-out ones. Healthy modems have `probe_error: null`. Failed or timed-out modems have `probe_error` set with an error string.
+
+**Healthy modem:**
 ```json
 {
     "success": true,
@@ -131,7 +135,33 @@ curl -s http://127.0.0.1:9000/modems/discover | python3 -m json.tool
             "signal": "+CSQ: 20,99",
             "imsi": "515039219149367",
             "iccid": "89630323255005160625",
-            "imei": "866358071697796"
+            "imei": "866358071697796",
+            "probe_error": null
+        }
+    ]
+}
+```
+
+**Failed/timed-out modem (partial result — this is expected, not a bug):**
+```json
+{
+    "success": true,
+    "modems": [
+        {
+            "sim_id": "3-7.2.4",
+            "modem_id": null,
+            "device_id": "3-7.2.4",
+            "port": "/dev/ttyUSB4",
+            "fallback_port": "/dev/ttyUSB5",
+            "interface": "if02",
+            "at_ok": false,
+            "sim_ready": false,
+            "creg_registered": false,
+            "signal": null,
+            "imsi": null,
+            "iccid": null,
+            "imei": null,
+            "probe_error": "PROBE_TIMEOUT after 12.0s"
         }
     ]
 }
@@ -139,12 +169,18 @@ curl -s http://127.0.0.1:9000/modems/discover | python3 -m json.tool
 
 | Field | Description |
 |---|---|
-| `sim_id` | IMSI — used to route SMS requests |
+| `sim_id` | IMSI — used to route SMS requests. Falls back to USB physical address if IMSI unavailable |
 | `modem_id` | IMEI — hardware identity, stays with device |
 | `device_id` | USB physical address (sysfs) |
 | `port` | Primary serial port (if02) |
 | `fallback_port` | Fallback serial port (if03) |
 | `signal` | Signal strength from AT+CSQ |
+| `at_ok` | `true` = modem responded to AT |
+| `sim_ready` | `true` = SIM inserted and readable |
+| `creg_registered` | `true` = registered on carrier network |
+| `probe_error` | `null` = healthy. Error string = probe failed or timed out. Inspect per device. |
+
+**Partial results are expected behavior.** If some modems return `probe_error`, debug those devices individually — the response will still contain all other modems correctly.
 
 ---
 
@@ -359,6 +395,31 @@ fuser /dev/ttyUSB2
 | `ModuleNotFoundError: No module named 'fastapi'` | Using system uvicorn instead of venv | Use `source .venv/bin/activate` first |
 | All modems busy after restart | ModemManager restarted | `sudo systemctl mask ModemManager` |
 
+### Diagnosing partial discovery results
+
+`/modems/discover` returning some modems with `probe_error` is expected when hardware is degraded. To diagnose:
+
+```bash
+# See full probe results including failures
+curl -s -H "X-Gateway-Token: <token>" http://127.0.0.1:9000/modems/discover \
+  | python3 -m json.tool
+
+# Check what holds each port
+fuser -v /dev/ttyUSB*
+
+# Manually test one port
+sudo minicom -D /dev/ttyUSB2 -b 115200
+```
+
+| `probe_error` value | Likely cause |
+|---|---|
+| `PORT_NOT_FOUND` | Port file gone — modem unplugged or kernel reassigned device node |
+| `MODEM_OPEN_FAILED` | Port held by another process (`fuser` to confirm) |
+| `PROBE_TIMEOUT after 12.0s` | Modem unresponsive to serial I/O — may need physical reset |
+| `AT_NOT_RESPONDING` | Port opens but modem not sending AT responses |
+
+If only some modems show `probe_error`, the other modems in the response are unaffected and usable for sending.
+
 ---
 
 ## How Modem Discovery Works
@@ -368,11 +429,19 @@ fuser /dev/ttyUSB2
 3. Filter: vendor ID must be `2c7c` (Quectel)
 4. Collect only `if=2` ports as primary (SMS interface)
 5. Derive `if=3` sibling as fallback — stored, never probed at startup
-6. Probe each `if=2` port: send `AT`, `AT+CPIN?`, `AT+CREG?`, `AT+CSQ`, `AT+CIMI`, `AT+CCID`, `AT+CGSN`
-7. Accept modem only if: `at_ok=True` AND `sim_ready=True` AND `creg_registered=True`
-8. Identity: `sim_id=IMSI`, `modem_id=IMEI`
+6. **Probe all `if=2` ports in parallel** — all N modems probed concurrently via thread pool
+7. Each probe sends: `AT`, `AT+CPIN?`, `AT+CREG?`, `AT+CSQ`, `AT+CIMI`, `AT+CCID`, `AT+CGSN`
+8. Hard wall-clock timeout per probe (default 12s) — a stuck port cannot block others
+9. Identity: `sim_id=IMSI`, `modem_id=IMEI`
 
-Result: N modems = exactly N serial probes at startup.
+**Two discovery modes:**
+
+| Mode | Used by | Returns |
+|---|---|---|
+| `detect_modems()` | Startup, warm cache refresh | Healthy modems only (at_ok + sim_ready + creg) |
+| `discover_all_modems()` | `/modems/discover` endpoint | All detected ports including unhealthy/timed-out |
+
+Result: N modems = N parallel probes, bounded at ~12s regardless of modem count.
 
 ### Registry warm refresh
 
@@ -380,4 +449,11 @@ After startup, the registry TTL is 10 seconds. On TTL expiry:
 - If all known ports still exist on filesystem → warm refresh (update TTL only, no I/O)
 - If any port disappears → full rescan
 
-`/modems/discover` always forces a full rescan regardless of TTL.
+`/modems/discover` always forces a full parallel rescan regardless of TTL. It also updates the routing cache with any healthy modems found.
+
+### Discovery resilience
+
+- One stuck or failing modem probe does **not** block the response
+- `/modems/discover` returns partial results — all detected ports are included
+- Modems that timed out or failed have `probe_error` set; others are unaffected
+- `serial.Serial()` opens with `exclusive=True` — a port held by another process raises an error immediately instead of blocking indefinitely

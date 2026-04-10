@@ -223,16 +223,20 @@ curl -X POST http://localhost:9000/send \
 
 ## GET /modems/discover
 
-Forces a full hardware rescan by probing all USB ports via sysfs. Takes 2–5 seconds.
+Forces a full hardware rescan by probing all USB ports via sysfs. All modem probes run in parallel with a hard per-modem timeout (default 12s). The response is bounded regardless of modem count or hardware state.
 
 **When to use:** Modem just plugged in, after server restart, or to refresh the full modem inventory. Do not call this on every send — the registry warm cache handles routine lookups.
+
+**Bounded response time:** The endpoint always returns within ~15 seconds even if every modem probe times out. It does not hang.
+
+**Partial results:** Returns ALL detected ports, including unhealthy and timed-out ones. A response with some modems showing `probe_error` is expected when hardware is degraded — it is not an error response. Inspect each modem's `probe_error` field individually. Healthy modems in the same response are unaffected.
 
 **Request headers:**
 ```
 X-Gateway-Token: <your-token>
 ```
 
-**Response:**
+**Healthy modem response:**
 ```json
 {
     "success": true,
@@ -250,29 +254,67 @@ X-Gateway-Token: <your-token>
             "signal": "+CSQ: 20,99",
             "imsi": "515039219149367",
             "iccid": "89630323255005160625",
-            "imei": "866358071697796"
+            "imei": "866358071697796",
+            "probe_error": null
         }
     ]
 }
 ```
 
+**Timed-out modem in the same response (partial result):**
+```json
+{
+    "sim_id": "3-7.2.4",
+    "modem_id": null,
+    "device_id": "3-7.2.4",
+    "port": "/dev/ttyUSB4",
+    "fallback_port": "/dev/ttyUSB5",
+    "interface": "if02",
+    "at_ok": false,
+    "sim_ready": false,
+    "creg_registered": false,
+    "signal": null,
+    "imsi": null,
+    "iccid": null,
+    "imei": null,
+    "probe_error": "PROBE_TIMEOUT after 12.0s"
+}
+```
+
 | Field | Description |
 |---|---|
-| `sim_id` | IMSI — use this as the key for `/send` |
+| `sim_id` | IMSI — use this as the key for `/send`. Falls back to USB physical address if IMSI unavailable. |
 | `modem_id` | IMEI — hardware identity, use for inventory tracking |
 | `iccid` | Physical SIM card serial number |
 | `device_id` | USB physical address (sysfs) — stable across reboots |
 | `port` | Primary serial port (interface if02) |
 | `fallback_port` | Fallback serial port (interface if03) |
-| `at_ok` | `true` = modem responds to AT commands |
+| `at_ok` | `true` = modem responded to AT commands |
 | `sim_ready` | `true` = SIM is inserted and readable |
 | `creg_registered` | `true` = registered on carrier network |
 | `signal` | Signal strength string from `AT+CSQ` |
+| `probe_error` | `null` = healthy. Error string = probe failed or timed out. Common values below. |
+
+**`probe_error` values:**
+
+| Value | Meaning |
+|---|---|
+| `null` | Modem healthy — all AT probes passed |
+| `"PORT_NOT_FOUND"` | Port file absent — modem unplugged or kernel reassigned device node |
+| `"MODEM_OPEN_FAILED"` | Port held by another process — check with `fuser /dev/ttyUSBX` |
+| `"PROBE_TIMEOUT after 12.0s"` | Modem did not respond within timeout — may need physical reset |
+| `"AT_NOT_RESPONDING"` | Port opened but modem not sending valid AT responses |
 
 **curl example:**
 ```bash
 curl http://localhost:9000/modems/discover \
   -H "X-Gateway-Token: your-token"
+```
+
+**Verify bounded response time:**
+```bash
+# Must return JSON quickly even with degraded hardware (-m 15 = 15s client timeout)
+curl -m 15 -H "X-Gateway-Token: your-token" http://localhost:9000/modems/discover
 ```
 
 ---

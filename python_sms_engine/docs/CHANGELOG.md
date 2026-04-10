@@ -67,6 +67,32 @@
 
 ---
 
+## [2026-04-10] – Discovery Timeout Fix: Parallel Probing + Bounded Timeout
+
+### Fixed
+- **Discovery hang bug**: One stuck modem serial probe could block the entire `/modems/discover` response indefinitely — request would hang until client timeout with no data returned
+- Root cause: `serial.Serial()` open on Linux tty can block without a wall-clock bound when a USB device is transitioning or held by a ghost process; probes were sequential so one blocked all others
+
+### Changed
+- Modem probes now run in parallel via `ThreadPoolExecutor` — all N modems probed concurrently, not sequentially
+- Hard per-modem wall-clock timeout (`PROBE_TIMEOUT_S = 12.0s`) enforced via `futures_wait(timeout=...)`; timed-out probes are marked and returned rather than blocking the response
+- `serial.Serial()` now opened with `exclusive=True` — raises `BlockingIOError` immediately if another process holds the port, instead of blocking indefinitely
+- `/modems/discover` now returns ALL detected ports including unhealthy and timed-out ones (previously returned only fully ready modems)
+- `discover_all_modems()` added as a separate function for full-result discovery; `detect_modems()` (used by startup/warm-cache path) still filters to healthy-only
+
+### Added
+- `probe_error` field in `/modems/discover` response per modem — `null` when healthy, error string when probe failed or timed out
+- `discover()` method on `ModemRegistry` — runs parallel probe, updates routing cache, returns all results
+- Focused tests for: one-hung-modem scenario, all-timeout scenario, port-not-found fast-path, bounded response time, partial result correctness
+
+### Notes
+- `/modems/discover` is now safe to call from Laravel even when hardware is degraded — partial results are expected and normal, not an error state
+- Unhealthy modems in the response should be inspected per `probe_error` field, not treated as a total discovery failure
+- The warm-cache path (`detect_modems`) is unchanged — startup and TTL-based refresh still filter to healthy modems only
+- Stuck probe threads may remain alive briefly after the timeout; they do not affect subsequent requests
+
+---
+
 ## [2026-04-06] – Phase 2 Hardening: Python API Authentication
 
 ### Added
