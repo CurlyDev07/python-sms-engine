@@ -474,7 +474,7 @@ class TestProbeTimeoutCaps:
     timeouts passed to probes, regardless of what the caller provides.
 
     Rules under test:
-      - probe_serial_timeout = min(serial_timeout, 1.0)
+      - probe_serial_timeout = min(serial_timeout, 0.1)
       - probe_command_timeout = min(command_timeout, 5.0)
       - Caps apply in both discover_all_modems and detect_modems.
       - Send path (send_sms) is unaffected — caps only in probe entry points.
@@ -492,7 +492,7 @@ class TestProbeTimeoutCaps:
         return fake_safe_probe, captured
 
     def test_discover_all_modems_caps_serial_timeout(self):
-        """discover_all_modems must cap serial_timeout to 1.0 before probing."""
+        """discover_all_modems must cap serial_timeout to 0.1 before probing."""
         entries = [("3-7.1", "/dev/ttyUSB0", "/dev/ttyUSB1")]
         fake_probe, captured = self._capture_probe_args()
 
@@ -500,8 +500,8 @@ class TestProbeTimeoutCaps:
             with patch("modem_detector._safe_probe", side_effect=fake_probe):
                 discover_all_modems(serial_timeout=3.0, command_timeout=5.0, probe_timeout=5.0)
 
-        assert captured["serial_timeout"] <= 1.0, (
-            f"Expected serial_timeout capped to ≤1.0, got {captured['serial_timeout']}"
+        assert captured["serial_timeout"] <= 0.1, (
+            f"Expected serial_timeout capped to ≤0.1, got {captured['serial_timeout']}"
         )
 
     def test_discover_all_modems_caps_command_timeout(self):
@@ -518,7 +518,7 @@ class TestProbeTimeoutCaps:
         )
 
     def test_detect_modems_caps_serial_timeout(self):
-        """detect_modems must cap serial_timeout to 1.0 before probing."""
+        """detect_modems must cap serial_timeout to 0.1 before probing."""
         entries = [("3-7.1", "/dev/ttyUSB0", "/dev/ttyUSB1")]
         fake_probe, captured = self._capture_probe_args()
 
@@ -526,8 +526,8 @@ class TestProbeTimeoutCaps:
             with patch("modem_detector._safe_probe", side_effect=fake_probe):
                 detect_modems(serial_timeout=3.0, command_timeout=5.0, probe_timeout=5.0)
 
-        assert captured["serial_timeout"] <= 1.0, (
-            f"Expected serial_timeout capped to ≤1.0, got {captured['serial_timeout']}"
+        assert captured["serial_timeout"] <= 0.1, (
+            f"Expected serial_timeout capped to ≤0.1, got {captured['serial_timeout']}"
         )
 
     def test_detect_modems_caps_command_timeout(self):
@@ -550,8 +550,8 @@ class TestProbeTimeoutCaps:
 
         with patch("modem_detector._collect_if02_ports", return_value=entries):
             with patch("modem_detector._safe_probe", side_effect=fake_probe):
-                discover_all_modems(serial_timeout=0.5, command_timeout=3.0, probe_timeout=5.0)
+                discover_all_modems(serial_timeout=0.05, command_timeout=3.0, probe_timeout=5.0)
 
         # Values already under cap — must be passed through unchanged
-        assert captured["serial_timeout"] == 0.5
+        assert captured["serial_timeout"] == 0.05
         assert captured["command_timeout"] == 3.0

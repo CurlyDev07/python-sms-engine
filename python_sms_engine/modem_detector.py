@@ -391,9 +391,12 @@ def discover_all_modems(
     Guaranteed to return within probe_timeout + sysfs scan time (~1s).
     """
     entries = _collect_if02_ports()
-    # Cap timeouts for probe path — prevents serial reads and AT sequences from
-    # consuming the full wall-clock budget, leaving margin within PROBE_TIMEOUT_S.
-    probe_serial_timeout = min(serial_timeout, 1.0)
+    # Cap timeouts for probe path.
+    # pyserial read(256) loops internally until 256 bytes arrive or serial_timeout expires —
+    # even when data is available sooner. With serial_timeout=1.0, every AT command costs
+    # ~1.0s regardless of modem response time. Cap to 0.1s: each read costs ≤0.1s,
+    # so a full probe completes in ~1.8s instead of ~10s.
+    probe_serial_timeout = min(serial_timeout, 0.1)
     probe_command_timeout = min(command_timeout, 5.0)
     raw_results = _run_parallel_probes(entries, probe_serial_timeout, probe_command_timeout, probe_timeout)
 
@@ -459,9 +462,12 @@ def detect_modems(
     One hung modem does not delay the rest.
     """
     entries = _collect_if02_ports()
-    # Cap timeouts for probe path — prevents serial reads and AT sequences from
-    # consuming the full wall-clock budget, leaving margin within PROBE_TIMEOUT_S.
-    probe_serial_timeout = min(serial_timeout, 1.0)
+    # Cap timeouts for probe path.
+    # pyserial read(256) loops internally until 256 bytes arrive or serial_timeout expires —
+    # even when data is available sooner. With serial_timeout=1.0, every AT command costs
+    # ~1.0s regardless of modem response time. Cap to 0.1s: each read costs ≤0.1s,
+    # so a full probe completes in ~1.8s instead of ~10s.
+    probe_serial_timeout = min(serial_timeout, 0.1)
     probe_command_timeout = min(command_timeout, 5.0)
     raw_results = _run_parallel_probes(entries, probe_serial_timeout, probe_command_timeout, probe_timeout)
 
