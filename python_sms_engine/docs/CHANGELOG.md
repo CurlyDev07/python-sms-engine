@@ -84,6 +84,24 @@
 
 ---
 
+## [2026-04-10] – Probe Timeout Budget Fix: Caps + Remove exclusive=True
+
+### Fixed
+- **All probes returning PROBE_TIMEOUT**: Every `/modems/discover` row showed `PROBE_TIMEOUT after 12.0s` even when ports responded manually via minicom
+- Root cause 1: `exclusive=True` (TIOCEXCL) — zombie threads from timed-out startup probes held open fds with TIOCEXCL set; subsequent probe opens blocked indefinitely instead of failing fast on this Linux kernel
+- Root cause 2: Insufficient probe budget margin — `PROBE_TIMEOUT_S=12.0` minus `command_timeout=10.0` minus ~1s setup overhead left only ~1s margin; USB latency on any AT command pushed threads into `not_done`
+- Root cause 3: `ser.read(256)` on Linux USB CDC-ACM can block beyond `serial_timeout` due to spurious `select()` wakeups; with `serial_timeout=3.0`, one blocked read consumed the entire remaining budget
+
+### Changed
+- Removed `exclusive=True` from `ModemATClient.open()` — TIOCEXCL no longer set; zombie probe threads from prior rounds cannot block new probe opens. ModemManager is masked so exclusive protection is not needed.
+- `discover_all_modems()` and `detect_modems()` now cap timeouts at probe entry: `probe_serial_timeout = min(serial_timeout, 1.0)`, `probe_command_timeout = min(command_timeout, 5.0)`. Worst-case per-probe: ~1s open + ~5s AT = ~6s, well within 12s wall-clock deadline.
+- Send path (`send_sms`) is unaffected — caps apply only inside probe entry points, not globally.
+
+### Added
+- Tests for timeout caps: `TestProbeTimeoutCaps` — verifies `_safe_probe` receives capped values in both `discover_all_modems` and `detect_modems`, and that values already within bounds are passed through unchanged.
+
+---
+
 ## [2026-04-10] – Discovery Timeout Fix: Parallel Probing + Bounded Timeout
 
 ### Fixed
@@ -93,7 +111,6 @@
 ### Changed
 - Modem probes now run in parallel via `ThreadPoolExecutor` — all N modems probed concurrently, not sequentially
 - Hard per-modem wall-clock timeout (`PROBE_TIMEOUT_S = 12.0s`) enforced via `futures_wait(timeout=...)`; timed-out probes are marked and returned rather than blocking the response
-- `serial.Serial()` now opened with `exclusive=True` — raises `BlockingIOError` immediately if another process holds the port, instead of blocking indefinitely
 - `/modems/discover` now returns ALL detected ports including unhealthy and timed-out ones (previously returned only fully ready modems)
 - `discover_all_modems()` added as a separate function for full-result discovery; `detect_modems()` (used by startup/warm-cache path) still filters to healthy-only
 

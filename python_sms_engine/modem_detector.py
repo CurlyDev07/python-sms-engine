@@ -391,7 +391,11 @@ def discover_all_modems(
     Guaranteed to return within probe_timeout + sysfs scan time (~1s).
     """
     entries = _collect_if02_ports()
-    raw_results = _run_parallel_probes(entries, serial_timeout, command_timeout, probe_timeout)
+    # Cap timeouts for probe path — prevents serial reads and AT sequences from
+    # consuming the full wall-clock budget, leaving margin within PROBE_TIMEOUT_S.
+    probe_serial_timeout = min(serial_timeout, 1.0)
+    probe_command_timeout = min(command_timeout, 5.0)
+    raw_results = _run_parallel_probes(entries, probe_serial_timeout, probe_command_timeout, probe_timeout)
 
     modems: List[Dict] = []
     for probe in raw_results:
@@ -455,7 +459,11 @@ def detect_modems(
     One hung modem does not delay the rest.
     """
     entries = _collect_if02_ports()
-    raw_results = _run_parallel_probes(entries, serial_timeout, command_timeout, probe_timeout)
+    # Cap timeouts for probe path — prevents serial reads and AT sequences from
+    # consuming the full wall-clock budget, leaving margin within PROBE_TIMEOUT_S.
+    probe_serial_timeout = min(serial_timeout, 1.0)
+    probe_command_timeout = min(command_timeout, 5.0)
+    raw_results = _run_parallel_probes(entries, probe_serial_timeout, probe_command_timeout, probe_timeout)
 
     modems: List[Dict] = []
     for probe in raw_results:

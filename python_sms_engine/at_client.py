@@ -81,7 +81,6 @@ class ModemATClient:
                 self.baudrate,
                 timeout=self.serial_timeout,
                 write_timeout=self.serial_timeout,
-                exclusive=True,  # fast-fail (BlockingIOError) if port held by another process
             )
             time.sleep(0.5)
             self._serial.reset_input_buffer()
