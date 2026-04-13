@@ -137,6 +137,34 @@ class InboundSpool:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def is_recent_duplicate(
+        self,
+        runtime_sim_id: str,
+        from_number: str,
+        message: str,
+        within_seconds: int = 30,
+    ) -> bool:
+        """
+        Returns True if the same (sim, from, message) was spooled in the last
+        `within_seconds` seconds. Guards against drain/+CMT push race delivering
+        the same physical SMS twice with different idempotency keys.
+        """
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=within_seconds)).isoformat()
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM inbound_spool
+                WHERE runtime_sim_id = ?
+                  AND from_number    = ?
+                  AND message        = ?
+                  AND created_at    >= ?
+                LIMIT 1
+                """,
+                (runtime_sim_id, from_number, message, cutoff),
+            ).fetchone()
+        return row is not None
+
     def pending_count(self) -> int:
         with self._lock:
             row = self._conn.execute(

@@ -199,6 +199,18 @@ class InboundListener(threading.Thread):
     # ------------------------------------------------------------------
 
     def _handle_inbound(self, from_number: str, message: str, received_at: str) -> None:
+        # Guard: skip if the same physical message was already spooled recently
+        if self._spool.is_recent_duplicate(
+            runtime_sim_id=self._runtime_sim_id,
+            from_number=from_number,
+            message=message,
+        ):
+            logger.info(
+                "INBOUND_DUPLICATE_SKIPPED sim=%s from=%s",
+                self._runtime_sim_id, from_number,
+            )
+            return
+
         logger.info(
             "INBOUND_RECEIVED sim=%s from=%s",
             self._runtime_sim_id, from_number,
@@ -212,11 +224,19 @@ class InboundListener(threading.Thread):
             received_at=received_at,
         )
 
-        # 2. Delete from SIM storage (prevents SIM filling up)
-        try:
-            self._cmd('AT+CMGDA="DEL ALL"')
-        except Exception:
-            # Non-fatal — message is already in spool
+        # 2. Delete from SIM storage (prevents SIM filling up).
+        #    Try numeric form first (AT+CMGDA=6) — more universally supported.
+        #    Fall back to string form. Non-fatal if both fail.
+        deleted = False
+        for cmd in ('AT+CMGDA=6', 'AT+CMGDA="DEL ALL"', 'AT+CMGD=1,4'):
+            try:
+                resp = self._cmd(cmd)
+                if "OK" in resp:
+                    deleted = True
+                    break
+            except Exception:
+                pass
+        if not deleted:
             logger.warning("INBOUND_SIM_DELETE_FAILED sim=%s", self._runtime_sim_id)
 
         # 3. Attempt immediate delivery to Laravel
@@ -259,6 +279,7 @@ class InboundListener(threading.Thread):
                 line = lines[i].strip()
                 m = _CMGL_HEADER_RE.match(line)
                 if m and i + 1 < len(lines):
+                    msg_index  = m.group(1)
                     from_number = m.group(2)
                     received_at = m.group(3)
                     message_body = lines[i + 1].strip()
@@ -267,6 +288,14 @@ class InboundListener(threading.Thread):
                             from_number=from_number,
                             message=message_body,
                             received_at=_modem_ts_to_iso(received_at),
+                        )
+                    # Delete this message by index immediately after processing
+                    try:
+                        self._cmd(f"AT+CMGD={msg_index}")
+                    except Exception:
+                        logger.warning(
+                            "INBOUND_DRAIN_DELETE_FAILED port=%s index=%s",
+                            self._port, msg_index,
                         )
                     i += 2
                 else:
