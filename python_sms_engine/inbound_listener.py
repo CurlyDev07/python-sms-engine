@@ -53,6 +53,34 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _modem_ts_to_iso(ts: str) -> str:
+    """
+    Convert GSM modem timestamp to ISO8601.
+
+    Modem format:  YY/MM/DD,HH:MM:SS±QQ
+    Example:       26/04/13,21:00:00+32   (±QQ = quarters of an hour, so +32 = +8h)
+
+    Falls back to current UTC time if parsing fails.
+    """
+    try:
+        date_part, time_tz = ts.split(",", 1)
+        yy, mm, dd = date_part.split("/")
+        m = re.match(r"(\d{2}:\d{2}:\d{2})([+-])(\d{2})", time_tz)
+        if not m:
+            return _now_iso()
+        time_str = m.group(1)
+        sign = m.group(2)
+        tz_minutes = int(m.group(3)) * 15
+        tz_h = tz_minutes // 60
+        tz_m = tz_minutes % 60
+        year = 2000 + int(yy)
+        iso = f"{year}-{mm}-{dd}T{time_str}{sign}{tz_h:02d}:{tz_m:02d}"
+        datetime.fromisoformat(iso)  # validate
+        return iso
+    except Exception:
+        return _now_iso()
+
+
 class InboundListener(threading.Thread):
     """
     One instance per active modem port. Runs for the lifetime of the process.
@@ -160,7 +188,7 @@ class InboundListener(threading.Thread):
                 self._handle_inbound(
                     from_number=pending_cmt_from,
                     message=message_body,
-                    received_at=pending_cmt_time or _now_iso(),
+                    received_at=_modem_ts_to_iso(pending_cmt_time) if pending_cmt_time else _now_iso(),
                 )
                 pending_cmt_from = None
                 pending_cmt_time = None
@@ -238,7 +266,7 @@ class InboundListener(threading.Thread):
                         self._handle_inbound(
                             from_number=from_number,
                             message=message_body,
-                            received_at=received_at,
+                            received_at=_modem_ts_to_iso(received_at),
                         )
                     i += 2
                 else:
