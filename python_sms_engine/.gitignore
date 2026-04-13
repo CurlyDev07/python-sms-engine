@@ -1,0 +1,5 @@
+.env
+inbound_spool.db
+__pycache__/
+*.pyc
+.venv/

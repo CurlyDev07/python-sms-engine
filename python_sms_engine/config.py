@@ -15,6 +15,10 @@ class Settings:
         # Shared secret for Laravel↔Python auth.
         # If empty or unset, auth is disabled (safe for local dev).
         self.engine_token: str = os.getenv("SMS_PYTHON_API_TOKEN", "")
+        # Inbound SMS listener — webhook target and retry policy.
+        # If inbound_webhook_url is empty, messages are spooled but not delivered.
+        self.inbound_webhook_url: str = os.getenv("SMS_ENGINE_INBOUND_WEBHOOK_URL", "")
+        self.inbound_retry_max: int = int(os.getenv("SMS_ENGINE_INBOUND_RETRY_MAX", "10"))
 
 settings = Settings()
 

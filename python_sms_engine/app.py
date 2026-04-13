@@ -5,6 +5,9 @@ import time
 from fastapi import Depends, FastAPI, Header, HTTPException
 
 from config import settings
+from inbound_listener import InboundListener
+from inbound_spool import InboundSpool
+from inbound_webhook import InboundRetryWorker
 from modem_manager import ModemManager
 from modem_registry import ModemRegistry
 from schemas import HealthResponse, ModemsDiscoverResponse, ModemsHealthResponse, SendRequest, SendResponse
@@ -84,6 +87,40 @@ def startup_event() -> None:
     # refresh_thread.start()
 
     # logger.info("AUTO_REFRESH_THREAD_STARTED")
+
+    # ------------------------------------------------------------------
+    # Inbound SMS listener — one thread per send-ready modem
+    # ------------------------------------------------------------------
+    spool = InboundSpool()
+    app.state.inbound_spool = spool
+
+    retry_worker = InboundRetryWorker(
+        spool=spool,
+        webhook_url=settings.inbound_webhook_url,
+        max_attempts=settings.inbound_retry_max,
+    )
+    retry_worker.start()
+    app.state.inbound_retry_worker = retry_worker
+
+    listeners = []
+    for modem in registry.get_all():
+        port = modem.get("port")
+        sim_id = modem.get("sim_id")
+        if not port or not sim_id:
+            continue
+        listener = InboundListener(
+            port=port,
+            runtime_sim_id=sim_id,
+            spool=spool,
+            webhook_url=settings.inbound_webhook_url,
+            max_webhook_attempts=settings.inbound_retry_max,
+        )
+        listener.start()
+        listeners.append(listener)
+        logger.info("INBOUND_LISTENER_LAUNCHED port=%s sim=%s", port, sim_id)
+
+    app.state.inbound_listeners = listeners
+    logger.info("INBOUND_LISTENERS_STARTED count=%s", len(listeners))
 
 
 @app.post("/send", response_model=SendResponse, dependencies=[Depends(_require_token)])
