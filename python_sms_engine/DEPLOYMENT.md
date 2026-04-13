@@ -52,9 +52,35 @@ pip install -r requirements.txt
 nano .env
 ```
 
-Add:
+Use `.env.example` as a template:
+```bash
+cp .env.example .env
+nano .env
+```
+
+At minimum, set the token and inbound webhook URL:
 ```
 SMS_PYTHON_API_TOKEN=your_token_here
+SMS_ENGINE_INBOUND_WEBHOOK_URL=http://127.0.0.1:8081/api/gateway/inbound
+```
+
+All available variables:
+```
+# Auth
+SMS_PYTHON_API_TOKEN=your_token_here
+
+# Server
+SMS_ENGINE_HOST=0.0.0.0
+SMS_ENGINE_PORT=9000
+
+# Serial / modem timeouts
+SMS_ENGINE_SERIAL_TIMEOUT=3
+SMS_ENGINE_COMMAND_TIMEOUT=10
+SMS_ENGINE_SEND_TIMEOUT=30
+
+# Inbound SMS (customer replies)
+SMS_ENGINE_INBOUND_WEBHOOK_URL=http://127.0.0.1:8081/api/gateway/inbound
+SMS_ENGINE_INBOUND_RETRY_MAX=10
 ```
 
 Lock permissions so other users cannot read it:

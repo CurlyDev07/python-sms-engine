@@ -19,6 +19,9 @@ Execution plane for SMS delivery using Quectel EC25 USB modems on Linux.
 | `modem_manager.py` | Health checks and modem summaries |
 | `at_client.py` | Serial port + AT command client |
 | `sms_service.py` | SMS send orchestration, error classification |
+| `inbound_listener.py` | Per-modem thread — AT+CNMI push listener |
+| `inbound_spool.py` | SQLite durability buffer for inbound messages |
+| `inbound_webhook.py` | HTTP delivery to Laravel with retry/backoff |
 
 ---
 
@@ -67,30 +70,34 @@ sudo usermod -aG dialout $USER
 
 ## Running the Service
 
-Always use the venv's uvicorn, not the system one:
+### Production (systemd — runs always, survives reboots)
+
+```bash
+sudo systemctl start sms-engine
+sudo systemctl status sms-engine
+```
+
+### Deploying updates
+
+```bash
+git pull
+sudo systemctl restart sms-engine
+```
+
+### Watch live logs
+
+```bash
+sudo journalctl -u sms-engine -f
+```
+
+### Manual run (local dev only)
 
 ```bash
 source .venv/bin/activate
 uvicorn app:app --host 0.0.0.0 --port 9000
 ```
 
-Or directly without activating:
-```bash
-.venv/bin/uvicorn app:app --host 0.0.0.0 --port 9000
-```
-
----
-
-## Restart Procedure (clean restart)
-
-Use this when updating code or after any crash:
-
-```bash
-find . -name "*.pyc" -delete && find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
-fuser -k 9000/tcp
-source .venv/bin/activate
-uvicorn app:app --host 0.0.0.0 --port 9000
-```
+See `DEPLOYMENT.md` for full setup instructions.
 
 ---
 

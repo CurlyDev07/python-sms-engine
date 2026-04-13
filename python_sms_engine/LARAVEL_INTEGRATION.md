@@ -52,6 +52,8 @@ Http::baseUrl(config('sms.python_engine_url'))
 
 ## Endpoints
 
+### Python → Laravel (outbound SMS, Laravel calls Python)
+
 | Method | Path | Auth required | Purpose |
 |---|---|---|---|
 | `GET` | `/health` | No | Service liveness check |
@@ -61,6 +63,12 @@ Http::baseUrl(config('sms.python_engine_url'))
 | `GET` | `/modems/health` | Yes | Per-modem health status |
 | `GET` | `/modems/summary` | Yes | Count of online/offline modems |
 | `GET` | `/modems/debug` | Yes | Full raw modem state dump (debugging only) |
+
+### Python → Laravel (inbound SMS, Python calls Laravel)
+
+| Method | Path | Direction | Purpose |
+|---|---|---|---|
+| `POST` | `/api/gateway/inbound` | Python → Laravel | Deliver a customer reply received on a SIM |
 
 ---
 
@@ -460,6 +468,106 @@ $summary = $response->json()['summary'];
 
 ---
 
+---
+
+## `POST /api/gateway/inbound` ← Laravel receives this from Python
+
+Python calls this endpoint when a customer replies to an SMS. Laravel must implement this route.
+
+**This is Python calling Laravel** — not Laravel calling Python.
+
+### Request (Python sends this)
+
+```json
+{
+    "idempotency_key": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "runtime_sim_id":  "515039219149367",
+    "customer_phone":  "+639171234567",
+    "message":         "Hello this is a reply",
+    "received_at":     "2026-04-13T21:00:00+08:00"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `idempotency_key` | UUID string | Stable across retries — dedupe on this field |
+| `runtime_sim_id` | string | IMSI of the receiving SIM — resolve to `tenant_sims.id` |
+| `customer_phone` | string | Sender phone number (E.164 format) |
+| `message` | string | Raw SMS body |
+| `received_at` | ISO 8601 | When the modem received the message |
+
+### Required response (Laravel must return this)
+
+```json
+{"ok": true}
+```
+
+Python treats delivery as successful **only if**:
+- HTTP status is 2xx, AND
+- Response body has `"ok": true`
+
+If Laravel returns HTTP 200 but `ok` is not `true`, Python retries with backoff. Laravel should return `ok: true` only after the row is durably written to the DB.
+
+**Full ACK example:**
+```json
+{
+    "ok": true,
+    "inbound_message_uuid": "ce2f440b-9238-4628-8939-e946d1a303ea",
+    "idempotency_key": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "queued_for_relay": true
+}
+```
+
+**Failure example (Python will retry):**
+```json
+{"ok": false, "error": "validation_failed"}
+```
+
+### Retry policy (Python side)
+
+| Attempt | Delay |
+|---|---|
+| 1 | Immediate |
+| 2 | 5s |
+| 3 | 15s |
+| 4 | 60s |
+| 5+ | 300s (cap) |
+
+Max attempts: `SMS_ENGINE_INBOUND_RETRY_MAX` (default 10). After max attempts, message is abandoned in Python spool but never deleted — it can be manually recovered.
+
+### Laravel implementation notes
+
+```php
+// Route: POST /api/gateway/inbound
+public function receiveInbound(Request $request): JsonResponse
+{
+    $validated = $request->validate([
+        'idempotency_key' => 'required|string',
+        'runtime_sim_id'  => 'required|string',
+        'customer_phone'  => 'required|string',
+        'message'         => 'required|string',
+        'received_at'     => 'required|string',
+    ]);
+
+    // Deduplicate — idempotency_key is stable across Python retries
+    $message = InboundMessage::firstOrCreate(
+        ['idempotency_key' => $validated['idempotency_key']],
+        [
+            'runtime_sim_id' => $validated['runtime_sim_id'],
+            'customer_phone' => $validated['customer_phone'],
+            'message'        => $validated['message'],
+            'received_at'    => $validated['received_at'],
+        ]
+    );
+
+    return response()->json(['ok' => true]);
+}
+```
+
+**Important:** Always return `ok: true` after a successful `firstOrCreate` — both on first insert and on duplicate (idempotent). Python retries until it gets `ok: true`.
+
+---
+
 ## Environment Variables (Python side, for reference)
 
 | Variable | Default | Description |
@@ -469,6 +577,8 @@ $summary = $response->json()['summary'];
 | `SMS_ENGINE_SEND_TIMEOUT` | `30` | Full send sequence timeout |
 | `SMS_ENGINE_PORT` | `8000` | HTTP port (production uses 9000) |
 | `SMS_PYTHON_API_TOKEN` | `` | Shared secret — auth disabled if unset |
+| `SMS_ENGINE_INBOUND_WEBHOOK_URL` | `` | Laravel `/api/gateway/inbound` URL — inbound disabled if unset |
+| `SMS_ENGINE_INBOUND_RETRY_MAX` | `10` | Max delivery attempts before abandoning a spooled message |
 
 ---
 
@@ -492,4 +602,7 @@ $summary = $response->json()['summary'];
 | Partial discovery results | ✅ `probe_error` per modem, one bad modem does not block others — 2026-04-10 |
 | `send_ready` field | ✅ Explicit send-readiness flag per modem row — 2026-04-10 |
 | `identifier_source` field | ✅ Explicit SIM identity source (`"imsi"` vs `"fallback_device_id"`) — 2026-04-10 |
+| Inbound SMS listener (AT+CNMI push) | ✅ Live-proven — 2026-04-14 |
+| Inbound SQLite spool + retry | ✅ Durable delivery with exponential backoff — 2026-04-14 |
+| Inbound Laravel webhook delivery | ✅ `ok:true` ACK-gated, dedup by idempotency_key — 2026-04-14 |
 | Per-modem send lock | ❌ Concurrent sends to same modem may collide (Task 012B) |

@@ -127,6 +127,49 @@
 
 ---
 
+## [2026-04-14] – Inbound SMS: Customer Reply Pipeline
+
+### Added
+- `inbound_listener.py` — one `InboundListener` thread per active modem port, configured via `AT+CNMI=2,2,0,0,0` for push-based unsolicited `+CMT:` notifications (near-instant, no polling)
+- `inbound_spool.py` — thread-safe SQLite durability buffer; messages are spooled before SIM delete, ensuring no data loss on crash or retry
+- `inbound_webhook.py` — HTTP delivery client with exponential backoff retry (`[0, 5, 15, 60, 300]` seconds); `InboundRetryWorker` background thread polls every 30s
+- `test_inbound_webhook.py` — verification script to test the full request/response cycle against Laravel without a real modem
+- `.env.example` — template with all environment variables documented
+- Startup drain: `AT+CMGL="ALL"` on listener start processes messages that arrived before the listener was running
+
+### Changed
+- Inbound webhook payload uses `customer_phone` (not `from`) to match Laravel contract
+- Delivery success now requires HTTP 2xx **and** `response["ok"] == True` — HTTP 200 with `ok:false` triggers retry
+- SIM delete uses `AT+CMGDA=6` (numeric, more universal) with string and flag fallbacks
+- Stored messages deleted by index (`AT+CMGD=N`) during drain — guaranteed per-message delete
+- Modem GSM timestamps (`YY/MM/DD,HH:MM:SS±QQ`) converted to ISO8601 before delivery — fixes Laravel `validation_failed` on `received_at`
+- Added recent-duplicate guard in spool — same (sim, from, message) within 30s is skipped to prevent drain/+CMT race delivering one SMS twice
+
+### New config vars
+```
+SMS_ENGINE_INBOUND_WEBHOOK_URL   — Laravel /api/gateway/inbound endpoint
+SMS_ENGINE_INBOUND_RETRY_MAX     — max delivery attempts (default: 10)
+```
+
+### New log events
+```
+INBOUND_RECEIVED          — message arrived from modem
+INBOUND_DUPLICATE_SKIPPED — dedup guard fired (same message within 30s)
+INBOUND_WEBHOOK_REQUEST   — about to POST to Laravel
+INBOUND_WEBHOOK_RESPONSE  — Laravel responded (status + ok value)
+INBOUND_ACK_FALSE         — 2xx but ok!=true (will retry)
+INBOUND_DELIVERED         — Laravel ACKed ok:true (real success only)
+INBOUND_DELIVERY_FAILED   — retry scheduled
+INBOUND_DELIVERY_ABANDONED — max attempts reached
+```
+
+### Verified live
+- `INBOUND_DELIVERED` fires only when Laravel returns `ok:true`
+- Laravel DB row confirmed by `SELECT WHERE idempotency_key = '...'`
+- Adding new modem: `sudo systemctl restart sms-engine` picks it up automatically
+
+---
+
 ## [2026-04-06] – Phase 2 Hardening: Python API Authentication
 
 ### Added

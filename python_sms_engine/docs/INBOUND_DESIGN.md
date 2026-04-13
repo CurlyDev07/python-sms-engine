@@ -1,12 +1,16 @@
 # Inbound SMS Listener — Design Document
 
-## Confirmed Direction
+**Status: Implemented and live as of 2026-04-14**
 
-- **Listener model**: Push-based via `AT+CNMI=2,2,0,0,0` per active modem port (near-instant)
+---
+
+## Architecture
+
+- **Listener model**: Push-based via `AT+CNMI=2,2,0,0,0` per active modem port (near-instant, no polling)
 - **Python boundary**: Transport/execution only — no tenant logic, no Laravel DB lookups
 - **Webhook target**: `POST /api/gateway/inbound` on Laravel
 - **Identity contract**: Python sends `runtime_sim_id` (IMSI). Laravel resolves to `tenant_sims.id` internally.
-- **Reliability**: ACK-gated delete with durable local spool + retry with backoff + idempotency key
+- **Reliability**: ACK-gated delete — spool first, delete from SIM, deliver to Laravel, mark delivered on `ok:true`
 - **Source of record**: Laravel DB. Python spool is a temporary reliability buffer only.
 
 ---
@@ -14,23 +18,25 @@
 ## End-to-End Flow
 
 ```
-Customer sends SMS
+Customer sends SMS reply
       ↓
    Carrier delivers to SIM
       ↓
-   Modem fires unsolicited "+CMT:" over serial  (AT+CNMI configured at startup)
+   Modem fires unsolicited "+CMT:" over serial  ← AT+CNMI configured at startup
       ↓
    InboundListener thread (one per modem port)
       ↓
-   1. Parse +CMT → extract from, message, timestamp
-   2. Generate idempotency_key (UUID)
-   3. Write to local SQLite spool (durable)         ← safe before deleting from SIM
-   4. AT+CMGD → delete from SIM                    ← SIM storage freed, spool has it
-   5. POST to Laravel /api/gateway/inbound
-      ↓ 200 ACK
-   6. Mark spool record as delivered
-      ↓ no ACK / error
-   6. Retry with exponential backoff (from spool)
+   1. Parse +CMT → extract from_number, message, timestamp
+   2. Convert modem timestamp (YY/MM/DD,HH:MM:SS±QQ) to ISO8601
+   3. Check recent-duplicate guard (same sim+from+message within 30s → skip)
+   4. Generate idempotency_key (UUID)
+   5. Write to local SQLite spool (durable)         ← safe before deleting from SIM
+   6. AT+CMGDA=6 → delete from SIM                 ← SIM storage freed, spool has it
+   7. POST to Laravel /api/gateway/inbound
+      ↓ 200 + {"ok":true}
+   8. Mark spool record as delivered
+      ↓ non-200 / ok!=true / network error
+   8. Retry with exponential backoff (from spool)
 ```
 
 ---
@@ -42,10 +48,10 @@ Customer sends SMS
 ```json
 {
     "idempotency_key": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-    "runtime_sim_id": "515039219149367",
-    "from": "+639171234567",
-    "message": "Hello this is a reply",
-    "received_at": "2026-04-13T21:00:00+08:00"
+    "runtime_sim_id":  "515039219149367",
+    "customer_phone":  "+639171234567",
+    "message":         "Hello this is a reply",
+    "received_at":     "2026-04-13T21:00:00+08:00"
 }
 ```
 
@@ -53,11 +59,19 @@ Customer sends SMS
 |---|---|---|
 | `idempotency_key` | UUID string | Stable across retries — Laravel uses this to dedupe |
 | `runtime_sim_id` | string | IMSI of the receiving SIM — Laravel resolves to `tenant_sims.id` |
-| `from` | string | Sender phone number as reported by carrier |
+| `customer_phone` | string | Sender phone number in E.164 format as reported by carrier |
 | `message` | string | Raw SMS body |
-| `received_at` | ISO 8601 | Timestamp modem reported for the message |
+| `received_at` | ISO 8601 | Modem-reported timestamp, converted to ISO8601 |
 
-Laravel must return `HTTP 200` to ACK. Any non-200 triggers retry.
+### ACK contract
+
+Laravel must return HTTP 200 **and** `{"ok": true}` to ACK. Any other response triggers retry.
+
+```json
+{"ok": true, "inbound_message_uuid": "...", "idempotency_key": "...", "queued_for_relay": true}
+```
+
+If Laravel returns HTTP 200 but `ok` is not `true` (e.g. `{"ok":false,"error":"validation_failed"}`), Python treats this as NOT delivered and retries with backoff.
 
 ---
 
@@ -76,7 +90,7 @@ CREATE TABLE inbound_spool (
     from_number     TEXT    NOT NULL,
     message         TEXT    NOT NULL,
     received_at     TEXT    NOT NULL,
-    status          TEXT    NOT NULL DEFAULT 'pending',   -- pending | delivered
+    status          TEXT    NOT NULL DEFAULT 'pending',   -- pending | delivered | abandoned
     attempts        INTEGER NOT NULL DEFAULT 0,
     last_attempt_at TEXT,
     created_at      TEXT    NOT NULL
@@ -84,9 +98,11 @@ CREATE TABLE inbound_spool (
 ```
 
 **Operations:**
-- `insert(record)` — write on receipt, before SIM delete
-- `mark_delivered(idempotency_key)` — called after Laravel 200 ACK
+- `insert()` — write on receipt, before SIM delete
+- `mark_delivered(idempotency_key)` — called after Laravel `ok:true` ACK
+- `record_attempt(idempotency_key)` — increment attempt counter before each POST
 - `get_pending()` — all undelivered records for retry loop
+- `is_recent_duplicate(sim, from, message)` — guard against drain/push race delivering same SMS twice
 
 **File location:** `inbound_spool.db` in working directory (not committed to git)
 
@@ -98,28 +114,42 @@ One thread per active modem port. Runs for the lifetime of the process.
 
 **Startup sequence per modem:**
 ```
-open serial port (serial_timeout=None — blocking read)
-AT+CMGF=1       ← text mode
-AT+CNMI=2,2,0,0,0   ← push unsolicited +CMT to serial immediately
-AT+CMGL="ALL"   ← drain any messages that arrived before listener started
-process any existing messages → spool → delete
-enter blocking read loop
+open serial port (1s read timeout for stop_event checking)
+AT+CMGF=1             ← text mode
+AT+CNMI=2,2,0,0,0     ← push unsolicited +CMT to serial immediately
+AT+CMGL="ALL"         ← drain any messages already stored on SIM
+  → process each stored message → spool → delete by index (AT+CMGD=N)
+enter readline loop
 ```
 
 **Read loop:**
 ```
 while running:
-    line = serial.readline()        ← blocks until data arrives
-    if line starts with "+CMT:":
-        next_line = serial.readline()   ← the message body
-        parse → spool → AT+CMGD → POST webhook
+    line = serial.readline()       ← 1s timeout, loops to check stop_event
+    if line matches +CMT header:
+        pending_cmt_from, pending_cmt_time = parse(line)
+    elif pending_cmt_from is not None:
+        message_body = line
+        handle_inbound(from, body, convert_timestamp(pending_cmt_time))
+        clear pending state
 ```
 
-**`+CMT:` format:**
+**Duplicate guard:** Before spooling, `is_recent_duplicate()` is checked. If the same (sim_id, from, message) was spooled within the last 30 seconds, the message is skipped with `INBOUND_DUPLICATE_SKIPPED` log. This handles the drain/push race where a stored message is both drained at startup AND arrives via +CMT push.
+
+**SIM deletion order (most to least supported):**
+1. `AT+CMGDA=6` — numeric form, most universal
+2. `AT+CMGDA="DEL ALL"` — string form fallback
+3. `AT+CMGD=1,4` — delete all flag fallback
+
+**`+CMT:` format (two-line unsolicited):**
 ```
 +CMT: "+639171234567","","26/04/13,21:00:00+32"
 Hello this is a reply
 ```
+
+**Modem timestamp format:** `YY/MM/DD,HH:MM:SS±QQ` where `QQ` is timezone offset in quarters of an hour. Python converts to ISO8601 before storing/sending (`26/04/13,21:00:00+32` → `2026-04-13T21:00:00+08:00`).
+
+**Auto-restart:** On serial error, the session closes and restarts after 10 seconds. Pending spool records are still retried by `InboundRetryWorker` during the downtime.
 
 ---
 
@@ -136,28 +166,50 @@ Attempt 4: 60s delay
 Attempt 5+: 300s delay (cap)
 ```
 
-Max attempts: configurable via `SMS_ENGINE_INBOUND_RETRY_MAX` (default: 10)
+Max attempts: configurable via `SMS_ENGINE_INBOUND_RETRY_MAX` (default: 10).
 
-A background retry thread wakes every 30s and re-delivers any `status=pending` spool records that haven't been ACKed.
+A background `InboundRetryWorker` thread wakes every 30s and re-delivers any `status=pending` spool records that haven't been ACKed and are past their backoff delay.
+
+**Delivery success criteria:**
+- HTTP status is 2xx, AND
+- Response body parses as JSON, AND
+- `response["ok"] == True`
+
+**Structured log events:**
+```
+INBOUND_WEBHOOK_REQUEST   key=... payload_keys=[...]
+INBOUND_WEBHOOK_RESPONSE  key=... status=... ok=...
+INBOUND_ACK_FALSE         key=... status=... body=...   ← 2xx but ok!=true
+INBOUND_DELIVERED         key=... sim=... from=...      ← only on real success
+INBOUND_DELIVERY_FAILED   key=... attempt=... next_retry_in=...
+INBOUND_DELIVERY_ABANDONED key=... attempts=...         ← max attempts reached
+```
 
 ---
 
-### 4. Changes to `app.py`
+### 4. `app.py` — Startup integration
 
 On startup, after modem discovery:
 ```python
-# For each send-ready modem, start an inbound listener thread
+spool = InboundSpool()
+
+retry_worker = InboundRetryWorker(spool=spool, webhook_url=..., max_attempts=...)
+retry_worker.start()
+
 for modem in registry.get_all():
-    if modem.get("send_ready"):
-        thread = InboundListener(port=modem["port"], sim_id=modem["sim_id"], ...)
-        thread.start()
+    port = modem.get("port")
+    sim_id = modem.get("sim_id")
+    if not port or not sim_id:
+        continue
+    listener = InboundListener(port=port, runtime_sim_id=sim_id, spool=spool, ...)
+    listener.start()
 ```
 
-No changes to any existing endpoints or send path.
+No changes to any existing endpoints or send path. Inbound is fully independent of outbound.
 
 ---
 
-### 5. New config entries (`config.py`)
+### 5. Config entries (`config.py`)
 
 ```python
 self.inbound_webhook_url = os.getenv("SMS_ENGINE_INBOUND_WEBHOOK_URL", "")
@@ -166,36 +218,23 @@ self.inbound_retry_max   = int(os.getenv("SMS_ENGINE_INBOUND_RETRY_MAX", "10"))
 
 Add to `.env`:
 ```
-SMS_ENGINE_INBOUND_WEBHOOK_URL=http://your-laravel-app.com/api/gateway/inbound
+SMS_ENGINE_INBOUND_WEBHOOK_URL=http://127.0.0.1:8081/api/gateway/inbound
+SMS_ENGINE_INBOUND_RETRY_MAX=10
 ```
+
+If `SMS_ENGINE_INBOUND_WEBHOOK_URL` is empty, messages are spooled but not delivered.
 
 ---
 
-## Files to Create
+## Adding New Modems
 
-| File | Purpose |
-|---|---|
-| `inbound_spool.py` | SQLite spool — insert, mark_delivered, get_pending |
-| `inbound_listener.py` | Per-modem thread — AT+CNMI config + +CMT parse loop |
-| `inbound_webhook.py` | HTTP POST to Laravel + retry with backoff |
+Inbound listeners are started once at process startup. To pick up a newly plugged modem:
 
-## Files to Modify
+```bash
+sudo systemctl restart sms-engine
+```
 
-| File | Change |
-|---|---|
-| `app.py` | Launch listener threads on startup after modem discovery |
-| `config.py` | Add `inbound_webhook_url`, `inbound_retry_max` |
-| `.env` | Add `SMS_ENGINE_INBOUND_WEBHOOK_URL` |
-| `docs/API.md` | Document inbound payload contract |
-| `LARAVEL_INTEGRATION.md` | Document `/api/gateway/inbound` endpoint spec |
-
-## Files NOT touched
-
-- `at_client.py` — send path unchanged
-- `sms_service.py` — send path unchanged
-- `modem_detector.py` — discovery unchanged
-- `modem_registry.py` — registry unchanged
-- `schemas.py` — no new API schemas needed (inbound is outbound webhook, not an endpoint)
+This causes a ~2-3 second downtime. All 50+ modems are re-scanned and listeners re-launched. Any SMS that arrives during the gap is stored on the SIM and drained by `AT+CMGL="ALL"` at startup.
 
 ---
 
@@ -204,6 +243,7 @@ SMS_ENGINE_INBOUND_WEBHOOK_URL=http://your-laravel-app.com/api/gateway/inbound
 | Concern | Owner |
 |---|---|
 | Parse `+CMT:` from serial | Python |
+| Convert modem timestamp to ISO8601 | Python |
 | Generate idempotency key | Python |
 | Spool to SQLite | Python |
 | Delete from SIM after spool | Python |
@@ -216,9 +256,15 @@ SMS_ENGINE_INBOUND_WEBHOOK_URL=http://your-laravel-app.com/api/gateway/inbound
 
 ---
 
-## Notes
+## Verification
 
-- Listener threads share no state with the send path — inbound and outbound are fully independent
-- If a modem is discovered after startup (e.g. SIM inserted later), a listener must be started for it at that point too
-- The spool DB file must be excluded from git (add `inbound_spool.db` to `.gitignore`)
-- If the engine restarts, the retry loop drains any `pending` spool records on startup before listening for new messages
+```bash
+# Test the webhook contract end-to-end without a real modem
+python3 test_inbound_webhook.py --url http://127.0.0.1:8081/api/gateway/inbound
+
+# Watch live inbound activity on server
+sudo journalctl -u sms-engine -f | grep --line-buffered "INBOUND"
+
+# Inspect spool state
+sqlite3 inbound_spool.db "SELECT status, COUNT(*) FROM inbound_spool GROUP BY status;"
+```
