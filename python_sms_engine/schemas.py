@@ -50,10 +50,26 @@ class ModemDiscoverItem(BaseModel):
     iccid: Optional[str] = None
     imei: Optional[str] = None
     probe_error: Optional[str] = None
-    # Contract-hardening fields — explicit send-readiness and identity source.
-    # Consumers should use these instead of re-deriving from individual flag fields.
+
+    # Send-readiness and identity source.
+    # send_ready       = realtime single-probe result (strict).
+    # effective_send_ready = smoothed result — only downgrades after 3 consecutive failures.
+    # Use effective_send_ready for UI/operator display.
+    # Use send_ready for strict hardware-state audit only.
     send_ready: bool = False
     identifier_source: str = "fallback_device_id"
+
+    # Stability fields — for UI hysteresis and operator diagnostics.
+    realtime_probe_ready: bool = False
+    effective_send_ready: bool = False
+    identifier_source_confidence: str = "low"  # high | medium | low
+    readiness_reason_code: Optional[str] = None
+
+    # Diagnostic timeline fields.
+    probe_timestamp: Optional[str] = None
+    consecutive_probe_failures: int = 0
+    last_good_probe_at: Optional[str] = None
+    last_good_imsi: Optional[str] = None
 
 
 class ModemsDiscoverResponse(BaseModel):
