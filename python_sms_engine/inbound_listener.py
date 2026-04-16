@@ -25,6 +25,7 @@ from typing import Optional
 
 import serial
 
+from at_client import get_port_lock
 from inbound_spool import InboundSpool
 from inbound_webhook import deliver_one
 
@@ -309,26 +310,50 @@ class InboundListener(threading.Thread):
     # ------------------------------------------------------------------
 
     def _cmd(self, command: str, timeout: float = 3.0) -> str:
-        """Send an AT command and read until OK/ERROR or timeout."""
+        """
+        Send an AT command and read until OK/ERROR or timeout.
+
+        Acquires the per-port write lock before sending. This ensures the write
+        cannot interleave with an active send_sms() transaction that holds the
+        same lock — preventing AT command bytes from landing in the AT+CMGS
+        text-entry window and contaminating an outbound SMS body.
+
+        If a send is in progress the call blocks until the send completes
+        (up to timeout + 30s), then proceeds. Non-fatal on lock timeout.
+        """
         if not self._ser or not self._ser.is_open:
             raise RuntimeError("serial port not open")
 
-        self._ser.write(f"{command}\r".encode("utf-8"))
-        self._ser.flush()
+        port_lock = get_port_lock(self._port)
+        # Wait up to send_timeout (30s) + our own command timeout.
+        lock_timeout = timeout + 30.0
+        acquired = port_lock.acquire(timeout=lock_timeout)
+        if not acquired:
+            logger.warning(
+                "INBOUND_CMD_LOCK_TIMEOUT port=%s cmd=%s — skipping",
+                self._port, command,
+            )
+            return ""
 
-        deadline = time.monotonic() + timeout
-        buffer = ""
+        try:
+            self._ser.write(f"{command}\r".encode("utf-8"))
+            self._ser.flush()
 
-        while time.monotonic() < deadline:
-            raw = self._ser.readline()
-            if raw:
-                line = raw.decode("utf-8", errors="ignore")
-                buffer += line
-                stripped = line.strip()
-                if stripped in ("OK", "ERROR") or stripped.startswith("+CME ERROR") or stripped.startswith("+CMS ERROR"):
-                    break
+            deadline = time.monotonic() + timeout
+            buffer = ""
 
-        return buffer
+            while time.monotonic() < deadline:
+                raw = self._ser.readline()
+                if raw:
+                    line = raw.decode("utf-8", errors="ignore")
+                    buffer += line
+                    stripped = line.strip()
+                    if stripped in ("OK", "ERROR") or stripped.startswith("+CME ERROR") or stripped.startswith("+CMS ERROR"):
+                        break
+
+            return buffer
+        finally:
+            port_lock.release()
 
     def _close_serial(self) -> None:
         if self._ser and self._ser.is_open:

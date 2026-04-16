@@ -1,10 +1,15 @@
+import logging
 import os
 import re
+import threading
 import time
+import uuid
 from typing import Dict, Iterable, Optional, Tuple
 
 import serial
 
+
+logger = logging.getLogger("python_sms_engine.at_client")
 
 ALLOWED_ERRORS = {
     "SIM_NOT_MAPPED",
@@ -17,6 +22,28 @@ ALLOWED_ERRORS = {
     "SEND_FAILED",
     "UNKNOWN_ERROR",
 }
+
+# ---------------------------------------------------------------------------
+# Per-port send locks
+#
+# Only one writer may hold a port's lock at a time. send_sms() acquires the
+# lock for its entire transaction (open → close). InboundListener._cmd()
+# acquires it briefly around each AT write.
+#
+# This prevents AT command bytes from a concurrent writer (inbound listener
+# session restarts, discovery probes) from landing inside the AT+CMGS
+# text-entry window and corrupting the outbound SMS body.
+# ---------------------------------------------------------------------------
+_port_locks: Dict[str, threading.Lock] = {}
+_port_locks_guard = threading.Lock()
+
+
+def get_port_lock(port: str) -> threading.Lock:
+    """Return the shared per-port write lock for the given serial port path."""
+    with _port_locks_guard:
+        if port not in _port_locks:
+            _port_locks[port] = threading.Lock()
+        return _port_locks[port]
 
 
 def _parse_at_error_codes(raw: str) -> Tuple[Optional[int], Optional[int]]:
@@ -231,6 +258,7 @@ class ModemATClient:
         return {"reachable": reachable, "at_ok": at_ok}
 
     def send_sms(self, phone: str, message: str, global_timeout: float) -> Dict[str, str]:
+        tx_id = uuid.uuid4().hex[:8]
         deadline = time.monotonic() + global_timeout
 
         responses: Dict[str, str] = {
@@ -242,9 +270,20 @@ class ModemATClient:
         }
 
         opened = False
+        lock_held = False
+        port_lock = get_port_lock(self.port)
 
         try:
-            print(f"[SEND START] port={self.port}")
+            # Acquire per-port lock before opening.
+            # Held for the entire transaction so no concurrent writer
+            # (inbound listener, discovery probe) can inject bytes into
+            # the CMGS text-entry window.
+            lock_timeout = max(1.0, deadline - time.monotonic())
+            if not port_lock.acquire(timeout=lock_timeout):
+                raise SMSExecutionError("MODEM_TIMEOUT")
+            lock_held = True
+
+            logger.info("SEND_TX_BEGIN tx_id=%s port=%s", tx_id, self.port)
 
             self.open()
             opened = True
@@ -270,14 +309,13 @@ class ModemATClient:
             else:
                 raise SMSExecutionError("AT_NOT_RESPONDING")
 
-            print("[STEP] AT OK")
             time.sleep(0.1)
 
-            # RESET MODEM STATE (clears any dirty state left by other processes)
+            # RESET MODEM STATE
             try:
                 self._command_expect_ok("ATZ", "AT_NOT_RESPONDING", deadline=deadline, retries=0)
             except SMSExecutionError:
-                pass  # ATZ failure is non-fatal
+                pass
             time.sleep(0.3)
 
             # DISABLE ECHO
@@ -296,8 +334,13 @@ class ModemATClient:
                 deadline=deadline,
                 retries=1,
             )
-            print("[STEP] CMGF OK")
             time.sleep(0.1)
+
+            # Extra flush immediately before CMGS — clears any bytes that
+            # accumulated in the kernel tty buffer during setup (echo fragments,
+            # unsolicited +CMT lines from inbound listener's fd).
+            if self._serial:
+                self._serial.reset_input_buffer()
 
             # START SEND
             self._write(
@@ -316,16 +359,21 @@ class ModemATClient:
             if ">" not in responses["cmgs_prompt"]:
                 raise SMSExecutionError("CMGS_PROMPT_FAILED", raw=responses["cmgs_prompt"])
 
-            # SEND MESSAGE
+            logger.info("SEND_PROMPT_READY tx_id=%s port=%s", tx_id, self.port)
+
+            # WRITE MESSAGE BODY — lock still held; no concurrent writer can
+            # inject bytes between here and the 0x1A terminator.
             payload = message.encode("utf-8", errors="ignore") + bytes([26])
             self._write(payload, timeout_code="SEND_FAILED", raw=responses["cmgs_prompt"])
 
-            print("[STEP] CMGS SENT")
+            logger.info(
+                "SEND_BODY_WRITE tx_id=%s port=%s message_len=%s",
+                tx_id, self.port, len(message),
+            )
 
             # WAIT FOR NETWORK
             time.sleep(1.5)
 
-            # 🔥 FULL RESPONSE READ (FINAL FIX)
             final_buffer = ""
             start_time = time.monotonic()
 
@@ -338,7 +386,6 @@ class ModemATClient:
                         chunk = self._serial.read_all().decode("utf-8", errors="ignore")
                         if chunk:
                             final_buffer += chunk
-                            print(f"[READ CHUNK] {chunk}")
                     except Exception:
                         pass
 
@@ -348,9 +395,16 @@ class ModemATClient:
 
             self._parse_final_response(responses["final"])
 
+            logger.info("SEND_TX_END tx_id=%s port=%s status=success", tx_id, self.port)
+
             return responses
 
         except SMSExecutionError as exc:
+            logger.warning(
+                "SEND_TX_END tx_id=%s port=%s status=failed error=%s",
+                tx_id, self.port, exc.code,
+            )
+
             raw_parts = [
                 responses.get("at", ""),
                 responses.get("ate0", ""),
@@ -367,3 +421,5 @@ class ModemATClient:
         finally:
             if opened:
                 self.close()
+            if lock_held:
+                port_lock.release()
