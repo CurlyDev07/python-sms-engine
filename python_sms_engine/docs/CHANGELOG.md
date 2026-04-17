@@ -170,6 +170,164 @@ INBOUND_DELIVERY_ABANDONED — max attempts reached
 
 ---
 
+## [2026-04-18] – Send Latency Optimization: 26s → ~800ms
+
+### Overview
+
+End-to-end SMS send time reduced from **24–26 seconds** to **~800ms–1.2s** on the Python side through four sequential fixes. Each fix addressed a distinct root cause identified via `SEND_TIMING` structured logs.
+
+### The Four Fixes
+
+#### Fix 1 — Replace polling final-read loop with `_read_until()` (26s → 15s)
+
+**Root cause:** After writing the SMS body, the original code did a fixed `sleep(1.5)` then polled `read_all()` every 200ms for up to 10 seconds regardless of when `+CMGS:` arrived. ATZ reset could also take up to `command_timeout` (10s) if the modem was slow.
+
+**Fix:** Replaced polling loop with `_read_until(expected=["+CMGS:", "OK"])` which exits the moment the terminal token appears. Removed ATZ from the normal send path (kept only as fallback recovery). Removed inter-command sleeps (post-AT, post-ATE0, post-CMGF). Reduced port open stabilize delay 500ms → 200ms.
+
+**Added:** `FAST_SEND_FLOW=true` feature flag — set `false` to revert to legacy path. Auto-fallback: if fast path fails, logs `fast_path_fallback=true` and retries via legacy.
+
+**Added:** Structured `SEND_TIMING` log per send:
+```
+SEND_TIMING tx_id=... port=... sim_id=... result=success fast_path=True
+  open_ms=205 setup_ms=9009 cmgs_prompt_ms=3003 final_wait_ms=3002 total_ms=15420
+```
+
+---
+
+#### Fix 2 — Dedicate if03 to inbound listener, if02 exclusive to outbound (15s, root cause identified)
+
+**Root cause:** The inbound listener (`AT+CNMI=2,2,0,0,0`) held `/dev/ttyUSBN` (if02) open permanently, blocking on `readline()`. When `send_sms()` opened its own fd to the same port and sent `AT\r`, the Linux kernel tty buffer delivered the modem's `OK` response to whichever fd's `read()` was already waiting — the listener's. `send_sms()` got nothing, waited the full `serial_timeout` (3s), retried. Result: `setup_ms=9009` (3 commands × 3s each).
+
+**Fix:** Each USB modem exposes two AT-capable ports: if02 (primary) and if03 (fallback). Dedicated if03 exclusively to the inbound listener and if02 exclusively to outbound sends. Zero read competition.
+
+**Changed** (`app.py`): `listen_port = modem.get("fallback_port") or port` — listener starts on if03 at every boot automatically.
+
+**Changed** (`inbound_listener.py`): Removed cross-port lock from `_cmd()` — listener and sender are on separate ports with independent locks.
+
+**Log change:**
+```
+INBOUND_LISTENER_LAUNCHED listen_port=/dev/ttyUSB3 send_port=/dev/ttyUSB2 sim=515020...
+```
+
+**Note:** Each USB modem exposes multiple ttyUSB ports per SIM. if02 = primary AT port. if03 = secondary AT port. Both talk to the same SIM. if03 was previously used only as a send fallback; it is now permanently assigned to the inbound listener.
+
+---
+
+#### Fix 3 — Persistent connection: keep if02 open between sends (15s → 6s)
+
+**Root cause:** `send_sms()` opened the serial port fresh for every send. On Linux, when a serial port closes, the modem drops DTR and enters a low-power state. On the next open, the modem's AT processor takes ~3 seconds to wake up before it responds to commands. With 3 setup commands (AT + ATE0 + CMGF=1), that was 3 × 3s = `setup_ms=9009` every single send.
+
+**Fix:** `ModemATClient.initialize()` opens the port once at startup and runs AT + ATE0 + CMGF=1 once. `ModemATClient.send_persistent()` skips all setup — goes straight to `AT+CMGS`. Port stays open for the lifetime of the process.
+
+**Changed** (`sms_service.py`): `SmsService` holds one persistent `ModemATClient` per port. `warm_up()` called at startup initializes all known send ports. Lazy init for ports that appear later.
+
+**Changed** (`app.py`): `service.warm_up(registry.get_all())` called after listeners start.
+
+**Removed:** Fallback send path to `fallback_port` (if03) — if03 is now the listener port and cannot be used for sending.
+
+**Result:** `open_ms=0 setup_ms=0` on every send after startup.
+
+---
+
+#### Fix 4 — Reduce `serial_timeout` from 3s to 0.2s (6s → ~800ms)
+
+**Root cause:** Even with the persistent connection, `cmgs_prompt_ms=3003` and `final_wait_ms=3002` — both exactly `serial_timeout=3s`. Each `ser.read(256)` blocks for 3 seconds when no data is available. The modem's `>` prompt and `+CMGS:` response were arriving just after the 3-second window closed, causing one full missed read per phase: 3s wasted on the prompt + 3s wasted on the final response = 6s total.
+
+**Fix:** Set `SMS_ENGINE_SERIAL_TIMEOUT=0.2` in `.env`. With 200ms reads, responses are caught within 200ms of arrival instead of up to 3s after.
+
+**Result:**
+```
+cmgs_prompt_ms=200  final_wait_ms=600  total_ms=801
+```
+
+The `final_wait_ms=600–800ms` is the **real GSM carrier response time** — the actual time the carrier takes to confirm delivery. This is the hardware/network floor that no software change can reduce.
+
+---
+
+### Final Benchmarks
+
+| Metric | Before | After |
+|---|---|---|
+| p50 send time (Python) | ~24s | ~900ms |
+| p95 send time (Python) | ~26s | ~1.2s |
+| `setup_ms` | 9,009ms | 0ms |
+| `cmgs_prompt_ms` | 3,003ms | 200ms |
+| `final_wait_ms` | 3,002ms | 600–800ms |
+| `open_ms` | 205ms | 0ms |
+
+End-to-end from chat app (Laravel → Python → modem → carrier → Python → Laravel response): approximately **2–4 seconds** depending on HTTP and Laravel processing overhead.
+
+---
+
+### Port Architecture (as of 2026-04-18)
+
+Each USB GSM modem exposes multiple serial ports per SIM:
+
+```
+/dev/ttyUSBN   (if02) — outbound sends only (persistent, always open)
+/dev/ttyUSBN+1 (if03) — inbound listener only (AT+CNMI, +CMT push)
+```
+
+This is auto-detected on every restart via sysfs. No manual configuration required when adding new modems.
+
+---
+
+### Configuration Change
+
+```
+SMS_ENGINE_SERIAL_TIMEOUT=0.2   ← was 3 (old default)
+```
+
+See `.env.example` for full explanation of this value.
+
+---
+
+### Known Limitations / Not Yet Tested
+
+- **Inbound SMS end-to-end (Python → Chat App) not yet verified.** The inbound pipeline is implemented and Python → Laravel webhook delivery has been confirmed. However, the full round-trip from an inbound SMS arriving on the modem through to appearing in the Chat App UI has not been tested end-to-end. This should be validated before treating inbound as production-ready.
+
+---
+
+## [2026-04-18] – Discovery Stability: Hysteresis + Identity Recovery
+
+### Added
+- `_device_state` per-device persistent state in `ModemRegistry`, keyed by USB physical address (`device_id`, e.g. `3-7.4.4`)
+- `_apply_hysteresis()` — smooths probe results across discover calls:
+  - `effective_send_ready` only downgrades after 3 consecutive failures (`_DOWNGRADE_THRESHOLD = 3`)
+  - A single transient bad probe does not flip the UI or remove the modem from the routing cache
+  - `last_good_imsi` restored when a probe returns no identity — prevents `sim_id` flapping to `fallback_device_id`
+- New fields on `/modems/discover` response per modem:
+  - `realtime_probe_ready` — raw single-probe result (strict)
+  - `effective_send_ready` — smoothed result after hysteresis (use this for UI/routing)
+  - `identifier_source_confidence` — `high` (fresh IMSI) / `medium` (recovered from cache) / `low` (never seen)
+  - `readiness_reason_code` — human-readable code when not ready (`PROBE_TIMEOUT`, `AT_NOT_RESPONDING`, `SIM_NOT_READY`, `CREG_NOT_REGISTERED`, `IMSI_UNAVAILABLE`)
+  - `probe_timestamp`, `consecutive_probe_failures`, `last_good_probe_at`, `last_good_imsi` — diagnostic timeline fields
+
+### Changed
+- `discover()` routes cache updated using `effective_send_ready` (not raw `send_ready`) — modems survive brief probe failures without being dropped from routing
+
+### New log events
+```
+MODEM_READY_STATE_CHANGED   — effective_send_ready flipped (with reason + failure count)
+IDENTIFIER_SOURCE_CHANGED   — IMSI changed between probes (SIM swap detection)
+IDENTIFIER_RECOVERED_FROM_CACHE — last_good_imsi restored after probe returned no identity
+```
+
+---
+
+## [2026-04-18] – Per-Port Send Lock: Prevents AT Command Injection
+
+### Fixed
+- **AT command text appearing in outbound SMS body** (e.g. `AT+CMGF=1` inserted into the message)
+- **Root cause:** Two open file descriptors on the same tty (inbound listener fd + send fd). During an inbound listener session restart, `AT+CMGF=1` was written while `send_sms()` was inside the AT+CMGS text-entry window. The modem treated the AT command bytes as message body.
+
+### Added
+- Per-port `threading.Lock` in `at_client.py` (`_port_locks` dict, `get_port_lock(port)`)
+- `send_sms()` acquires the lock before `open()`, holds it for the entire transaction (open → close)
+- `InboundListener._cmd()` acquires the lock around every write (since superseded by the if02/if03 port split — lock now primarily guards against concurrent send attempts)
+
+---
+
 ## [2026-04-06] – Phase 2 Hardening: Python API Authentication
 
 ### Added
