@@ -108,8 +108,11 @@ def startup_event() -> None:
         sim_id = modem.get("sim_id")
         if not port or not sim_id:
             continue
+        # if03 is dedicated to inbound listening; if02 stays exclusive for outbound sends.
+        # Falls back to if02 if fallback_port is not present.
+        listen_port = modem.get("fallback_port") or port
         listener = InboundListener(
-            port=port,
+            port=listen_port,
             runtime_sim_id=sim_id,
             spool=spool,
             webhook_url=settings.inbound_webhook_url,
@@ -117,7 +120,7 @@ def startup_event() -> None:
         )
         listener.start()
         listeners.append(listener)
-        logger.info("INBOUND_LISTENER_LAUNCHED port=%s sim=%s", port, sim_id)
+        logger.info("INBOUND_LISTENER_LAUNCHED listen_port=%s send_port=%s sim=%s", listen_port, port, sim_id)
 
     app.state.inbound_listeners = listeners
     logger.info("INBOUND_LISTENERS_STARTED count=%s", len(listeners))
