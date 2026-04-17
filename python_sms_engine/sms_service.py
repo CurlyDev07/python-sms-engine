@@ -65,7 +65,7 @@ class SmsService:
 
         raise SMSExecutionError("SIM_NOT_MAPPED")
 
-    def _send_via_port(self, port: str, phone: str, message: str) -> Dict[str, str]:
+    def _send_via_port(self, port: str, phone: str, message: str, sim_id: Optional[str] = None) -> Dict[str, str]:
         client = ModemATClient(
             port=port,
             serial_timeout=self.serial_timeout,
@@ -75,6 +75,7 @@ class SmsService:
             phone=phone,
             message=message,
             global_timeout=self.send_timeout,
+            sim_id=sim_id,
         )
 
     def send(
@@ -103,7 +104,7 @@ class SmsService:
 
             # STEP 2: try primary port (if02)
             try:
-                raw_steps = self._send_via_port(port, phone, message)
+                raw_steps = self._send_via_port(port, phone, message, sim_id=sim_id)
                 duration_ms = int((time.monotonic() - started_at) * 1000)
                 merged_raw = _truncate_raw("\n".join(v for v in raw_steps.values() if v))
 
@@ -140,7 +141,7 @@ class SmsService:
                 # STEP 3: retry on same port (hardware errors only)
                 try:
                     time.sleep(0.5)
-                    raw_steps = self._send_via_port(port, phone, message)
+                    raw_steps = self._send_via_port(port, phone, message, sim_id=sim_id)
                     logger.info("RETRY SUCCESS sim_id=%s port=%s", sim_id, port)
 
                     return SendResponse(
@@ -170,7 +171,7 @@ class SmsService:
                     )
 
                     try:
-                        raw_steps = self._send_via_port(fallback, phone, message)
+                        raw_steps = self._send_via_port(fallback, phone, message, sim_id=sim_id)
                         logger.info("FALLBACK SUCCESS sim_id=%s port=%s", sim_id, fallback)
 
                         # update registry so next send uses if03 directly

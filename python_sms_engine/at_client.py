@@ -37,6 +37,12 @@ ALLOWED_ERRORS = {
 _port_locks: Dict[str, threading.Lock] = {}
 _port_locks_guard = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Fast send path feature flag.
+# Set FAST_SEND_FLOW=false in .env to revert to the legacy polling loop.
+# ---------------------------------------------------------------------------
+FAST_SEND_FLOW: bool = os.environ.get("FAST_SEND_FLOW", "true").lower() not in ("false", "0", "no")
+
 
 def get_port_lock(port: str) -> threading.Lock:
     """Return the shared per-port write lock for the given serial port path."""
@@ -109,7 +115,7 @@ class ModemATClient:
                 timeout=self.serial_timeout,
                 write_timeout=self.serial_timeout,
             )
-            time.sleep(0.5)
+            time.sleep(0.2)  # 200ms sufficient for modem to stabilize post-open (was 500ms)
             self._serial.reset_input_buffer()
             self._serial.reset_output_buffer()
         except FileNotFoundError as exc:
@@ -257,9 +263,206 @@ class ModemATClient:
 
         return {"reachable": reachable, "at_ok": at_ok}
 
-    def send_sms(self, phone: str, message: str, global_timeout: float) -> Dict[str, str]:
+    # ------------------------------------------------------------------
+    # Timing log helper
+    # ------------------------------------------------------------------
+
+    def _log_send_timing(
+        self,
+        tx_id: str,
+        sim_id: Optional[str],
+        timing: Dict[str, int],
+        result: str,
+        fast_path: bool,
+        error: Optional[str] = None,
+    ) -> None:
+        logger.info(
+            "SEND_TIMING tx_id=%s port=%s sim_id=%s result=%s fast_path=%s "
+            "open_ms=%s setup_ms=%s cmgs_prompt_ms=%s final_wait_ms=%s total_ms=%s%s",
+            tx_id, self.port, sim_id or "?", result, fast_path,
+            timing.get("open_ms", "?"),
+            timing.get("setup_ms", "?"),
+            timing.get("cmgs_prompt_ms", "?"),
+            timing.get("final_wait_ms", "?"),
+            timing.get("total_ms", "?"),
+            f" error={error}" if error else "",
+        )
+
+    # ------------------------------------------------------------------
+    # Fast send path — no ATZ, no inter-command sleeps, blocking final read
+    # ------------------------------------------------------------------
+
+    def _fast_path(
+        self,
+        phone: str,
+        message: str,
+        deadline: float,
+        responses: Dict[str, str],
+        timing: Dict[str, int],
+        tx_id: str,
+    ) -> None:
+        t_setup_start = time.monotonic()
+
+        # AT CHECK
+        for _ in range(3):
+            try:
+                responses["at"] = self._command_expect_ok("AT", "AT_NOT_RESPONDING", deadline=deadline)
+                if "OK" in responses["at"]:
+                    break
+            except Exception:
+                time.sleep(0.3)
+        else:
+            raise SMSExecutionError("AT_NOT_RESPONDING")
+
+        # DISABLE ECHO
+        responses["ate0"] = self._command_expect_ok("ATE0", "AT_NOT_RESPONDING", deadline=deadline)
+
+        # TEXT MODE
+        responses["cmgf"] = self._command_expect_ok("AT+CMGF=1", "CMGF_FAILED", deadline=deadline, retries=1)
+
+        timing["setup_ms"] = int((time.monotonic() - t_setup_start) * 1000)
+
+        # Flush before CMGS — clears any echo fragments or unsolicited lines
+        if self._serial:
+            self._serial.reset_input_buffer()
+
+        # CMGS PROMPT
+        t_prompt_start = time.monotonic()
+        self._write(f'AT+CMGS="{phone}"\r'.encode("utf-8"), timeout_code="CMGS_PROMPT_FAILED", raw=responses["cmgf"])
+        responses["cmgs_prompt"] = self._read_until(
+            expected=[">"],
+            failure=["ERROR", "+CMS ERROR", "+CME ERROR"],
+            timeout=self._step_timeout(deadline),
+            timeout_code="CMGS_PROMPT_FAILED",
+        )
+        if ">" not in responses["cmgs_prompt"]:
+            raise SMSExecutionError("CMGS_PROMPT_FAILED", raw=responses["cmgs_prompt"])
+        timing["cmgs_prompt_ms"] = int((time.monotonic() - t_prompt_start) * 1000)
+
+        logger.info("SEND_PROMPT_READY tx_id=%s port=%s", tx_id, self.port)
+
+        # WRITE BODY — lock still held; no concurrent writer can inject bytes
+        payload = message.encode("utf-8", errors="ignore") + bytes([26])
+        self._write(payload, timeout_code="SEND_FAILED", raw=responses["cmgs_prompt"])
+        logger.info("SEND_BODY_WRITE tx_id=%s port=%s message_len=%s", tx_id, self.port, len(message))
+
+        # FINAL READ — returns immediately when +CMGS: or OK arrives
+        t_final_start = time.monotonic()
+        responses["final"] = self._read_until(
+            expected=["+CMGS:", "OK"],
+            failure=["ERROR", "+CMS ERROR", "+CME ERROR"],
+            timeout=self._step_timeout(deadline),
+            timeout_code="SEND_FAILED",
+        )
+        timing["final_wait_ms"] = int((time.monotonic() - t_final_start) * 1000)
+
+        self._parse_final_response(responses["final"])
+
+    # ------------------------------------------------------------------
+    # Legacy send path — ATZ reset, inter-command sleeps, polling final read
+    # ------------------------------------------------------------------
+
+    def _legacy_path(
+        self,
+        phone: str,
+        message: str,
+        deadline: float,
+        responses: Dict[str, str],
+        timing: Dict[str, int],
+        tx_id: str,
+    ) -> None:
+        t_setup_start = time.monotonic()
+
+        # AT CHECK
+        for _ in range(3):
+            try:
+                responses["at"] = self._command_expect_ok("AT", "AT_NOT_RESPONDING", deadline=deadline)
+                if "OK" in responses["at"]:
+                    break
+            except Exception:
+                time.sleep(0.3)
+        else:
+            raise SMSExecutionError("AT_NOT_RESPONDING")
+
+        time.sleep(0.1)
+
+        # RESET MODEM STATE
+        try:
+            self._command_expect_ok("ATZ", "AT_NOT_RESPONDING", deadline=deadline, retries=0)
+        except SMSExecutionError:
+            pass
+        time.sleep(0.3)
+
+        # DISABLE ECHO
+        responses["ate0"] = self._command_expect_ok("ATE0", "AT_NOT_RESPONDING", deadline=deadline)
+        time.sleep(0.1)
+
+        # TEXT MODE
+        responses["cmgf"] = self._command_expect_ok("AT+CMGF=1", "CMGF_FAILED", deadline=deadline, retries=1)
+        time.sleep(0.1)
+
+        timing["setup_ms"] = int((time.monotonic() - t_setup_start) * 1000)
+
+        if self._serial:
+            self._serial.reset_input_buffer()
+
+        # CMGS PROMPT
+        t_prompt_start = time.monotonic()
+        self._write(f'AT+CMGS="{phone}"\r'.encode("utf-8"), timeout_code="CMGS_PROMPT_FAILED", raw=responses["cmgf"])
+        responses["cmgs_prompt"] = self._read_until(
+            expected=[">"],
+            failure=["ERROR", "+CMS ERROR", "+CME ERROR"],
+            timeout=self._step_timeout(deadline),
+            timeout_code="CMGS_PROMPT_FAILED",
+        )
+        if ">" not in responses["cmgs_prompt"]:
+            raise SMSExecutionError("CMGS_PROMPT_FAILED", raw=responses["cmgs_prompt"])
+        timing["cmgs_prompt_ms"] = int((time.monotonic() - t_prompt_start) * 1000)
+
+        logger.info("SEND_PROMPT_READY tx_id=%s port=%s", tx_id, self.port)
+
+        # WRITE BODY
+        payload = message.encode("utf-8", errors="ignore") + bytes([26])
+        self._write(payload, timeout_code="SEND_FAILED", raw=responses["cmgs_prompt"])
+        logger.info("SEND_BODY_WRITE tx_id=%s port=%s message_len=%s", tx_id, self.port, len(message))
+
+        # POLLING FINAL READ (legacy)
+        time.sleep(1.5)
+        final_buffer = ""
+        start_time = time.monotonic()
+        t_final_start = time.monotonic()
+
+        while True:
+            if time.monotonic() - start_time > max(5, self._step_timeout(deadline)):
+                break
+            if self._serial:
+                try:
+                    chunk = self._serial.read_all().decode("utf-8", errors="ignore")
+                    if chunk:
+                        final_buffer += chunk
+                except Exception:
+                    pass
+            time.sleep(0.2)
+
+        responses["final"] = final_buffer.strip()
+        timing["final_wait_ms"] = int((time.monotonic() - t_final_start) * 1000)
+
+        self._parse_final_response(responses["final"])
+
+    # ------------------------------------------------------------------
+    # send_sms — fast path with auto-fallback to legacy
+    # ------------------------------------------------------------------
+
+    def send_sms(
+        self,
+        phone: str,
+        message: str,
+        global_timeout: float,
+        sim_id: Optional[str] = None,
+    ) -> Dict[str, str]:
         tx_id = uuid.uuid4().hex[:8]
         deadline = time.monotonic() + global_timeout
+        t_start = time.monotonic()
 
         responses: Dict[str, str] = {
             "at": "",
@@ -268,138 +471,61 @@ class ModemATClient:
             "cmgs_prompt": "",
             "final": "",
         }
+        timing: Dict[str, int] = {}
 
         opened = False
         lock_held = False
         port_lock = get_port_lock(self.port)
 
         try:
-            # Acquire per-port lock before opening.
-            # Held for the entire transaction so no concurrent writer
-            # (inbound listener, discovery probe) can inject bytes into
-            # the CMGS text-entry window.
+            # Acquire per-port lock before opening — held for entire transaction.
             lock_timeout = max(1.0, deadline - time.monotonic())
             if not port_lock.acquire(timeout=lock_timeout):
                 raise SMSExecutionError("MODEM_TIMEOUT")
             lock_held = True
 
-            logger.info("SEND_TX_BEGIN tx_id=%s port=%s", tx_id, self.port)
+            logger.info("SEND_TX_BEGIN tx_id=%s port=%s sim_id=%s", tx_id, self.port, sim_id or "?")
 
             self.open()
             opened = True
+            timing["open_ms"] = int((time.monotonic() - t_start) * 1000)
 
             if self._serial:
                 self._serial.write(b"\r\r\r")
                 time.sleep(0.2)
                 self._serial.reset_input_buffer()
 
-            # AT CHECK
-            for _ in range(3):
+            if FAST_SEND_FLOW:
                 try:
-                    responses["at"] = self._command_expect_ok(
-                        "AT",
-                        "AT_NOT_RESPONDING",
-                        deadline=deadline,
-                        retries=0,
+                    self._fast_path(phone, message, deadline, responses, timing, tx_id)
+                    timing["total_ms"] = int((time.monotonic() - t_start) * 1000)
+                    self._log_send_timing(tx_id, sim_id, timing, result="success", fast_path=True)
+                    logger.info("SEND_TX_END tx_id=%s port=%s status=success", tx_id, self.port)
+                    return responses
+                except SMSExecutionError as fast_exc:
+                    logger.warning(
+                        "SEND_FAST_PATH_FAILED tx_id=%s port=%s error=%s fast_path_fallback=true",
+                        tx_id, self.port, fast_exc.code,
                     )
-                    if "OK" in responses["at"]:
-                        break
-                except Exception:
-                    time.sleep(0.3)
-            else:
-                raise SMSExecutionError("AT_NOT_RESPONDING")
-
-            time.sleep(0.1)
-
-            # RESET MODEM STATE
-            try:
-                self._command_expect_ok("ATZ", "AT_NOT_RESPONDING", deadline=deadline, retries=0)
-            except SMSExecutionError:
-                pass
-            time.sleep(0.3)
-
-            # DISABLE ECHO
-            responses["ate0"] = self._command_expect_ok(
-                "ATE0",
-                "AT_NOT_RESPONDING",
-                deadline=deadline,
-                retries=0,
-            )
-            time.sleep(0.1)
-
-            # TEXT MODE
-            responses["cmgf"] = self._command_expect_ok(
-                "AT+CMGF=1",
-                "CMGF_FAILED",
-                deadline=deadline,
-                retries=1,
-            )
-            time.sleep(0.1)
-
-            # Extra flush immediately before CMGS — clears any bytes that
-            # accumulated in the kernel tty buffer during setup (echo fragments,
-            # unsolicited +CMT lines from inbound listener's fd).
-            if self._serial:
-                self._serial.reset_input_buffer()
-
-            # START SEND
-            self._write(
-                f'AT+CMGS="{phone}"\r'.encode("utf-8"),
-                timeout_code="CMGS_PROMPT_FAILED",
-                raw=responses["cmgf"],
-            )
-
-            responses["cmgs_prompt"] = self._read_until(
-                expected=[">"],
-                failure=["ERROR", "+CMS ERROR", "+CME ERROR"],
-                timeout=self._step_timeout(deadline),
-                timeout_code="CMGS_PROMPT_FAILED",
-            )
-
-            if ">" not in responses["cmgs_prompt"]:
-                raise SMSExecutionError("CMGS_PROMPT_FAILED", raw=responses["cmgs_prompt"])
-
-            logger.info("SEND_PROMPT_READY tx_id=%s port=%s", tx_id, self.port)
-
-            # WRITE MESSAGE BODY — lock still held; no concurrent writer can
-            # inject bytes between here and the 0x1A terminator.
-            payload = message.encode("utf-8", errors="ignore") + bytes([26])
-            self._write(payload, timeout_code="SEND_FAILED", raw=responses["cmgs_prompt"])
-
-            logger.info(
-                "SEND_BODY_WRITE tx_id=%s port=%s message_len=%s",
-                tx_id, self.port, len(message),
-            )
-
-            # WAIT FOR NETWORK
-            time.sleep(1.5)
-
-            final_buffer = ""
-            start_time = time.monotonic()
-
-            while True:
-                if time.monotonic() - start_time > max(5, self._step_timeout(deadline)):
-                    break
-
-                if self._serial:
+                    # ATZ recovery before legacy retry
                     try:
-                        chunk = self._serial.read_all().decode("utf-8", errors="ignore")
-                        if chunk:
-                            final_buffer += chunk
+                        if self._serial:
+                            self._serial.reset_input_buffer()
+                        self._command_expect_ok("ATZ", "AT_NOT_RESPONDING", deadline=deadline, retries=0)
+                        time.sleep(0.3)
                     except Exception:
                         pass
 
-                time.sleep(0.2)
-
-            responses["final"] = final_buffer.strip()
-
-            self._parse_final_response(responses["final"])
-
+            # Legacy path — FAST_SEND_FLOW=false or fast path fallback
+            self._legacy_path(phone, message, deadline, responses, timing, tx_id)
+            timing["total_ms"] = int((time.monotonic() - t_start) * 1000)
+            self._log_send_timing(tx_id, sim_id, timing, result="success", fast_path=False)
             logger.info("SEND_TX_END tx_id=%s port=%s status=success", tx_id, self.port)
-
             return responses
 
         except SMSExecutionError as exc:
+            timing["total_ms"] = int((time.monotonic() - t_start) * 1000)
+            self._log_send_timing(tx_id, sim_id, timing, result="failed", fast_path=FAST_SEND_FLOW, error=exc.code)
             logger.warning(
                 "SEND_TX_END tx_id=%s port=%s status=failed error=%s",
                 tx_id, self.port, exc.code,
