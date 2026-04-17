@@ -125,6 +125,12 @@ def startup_event() -> None:
     app.state.inbound_listeners = listeners
     logger.info("INBOUND_LISTENERS_STARTED count=%s", len(listeners))
 
+    # Pre-open and configure persistent send connections (if02) for all ready modems.
+    # After this, every send goes straight to AT+CMGS — no open/setup overhead.
+    service: SmsService = app.state.sms_service
+    service.warm_up(registry.get_all())
+    logger.info("MODEM_CLIENTS_WARMED_UP")
+
 
 @app.post("/send", response_model=SendResponse, dependencies=[Depends(_require_token)])
 def send_sms(request: SendRequest) -> SendResponse:

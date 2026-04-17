@@ -1,6 +1,7 @@
 import logging
+import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from at_client import ModemATClient, SMSExecutionError
 from modem_registry import ModemRegistry
@@ -10,10 +11,6 @@ logger = logging.getLogger("python_sms_engine")
 
 RAW_MAX_LEN = 500
 
-# Error layer classification for Laravel to distinguish failure cause:
-#   hardware → serial/port-level failure (modem physically dead or unplugged)
-#   modem    → CME error (SIM not inserted, SIM failure, PIN required, etc.)
-#   network  → CMS error (no credit, destination unreachable, carrier reject)
 _HARDWARE_ERRORS = {
     "PORT_NOT_FOUND",
     "MODEM_OPEN_FAILED",
@@ -54,24 +51,66 @@ class SmsService:
         self.serial_timeout = serial_timeout
         self.command_timeout = command_timeout
         self.send_timeout = send_timeout
+        self._clients: Dict[str, ModemATClient] = {}
+        self._clients_lock = threading.Lock()
 
-    def _port_for_sim(self, sim_id: str) -> str:
-        modem = self.registry.get_by_sim_id(sim_id=sim_id)
+    # ------------------------------------------------------------------
+    # Persistent client management
+    # ------------------------------------------------------------------
 
-        if modem and modem.get("at_ok"):
-            port = modem.get("port")
-            if isinstance(port, str) and port:
-                return port
-
-        raise SMSExecutionError("SIM_NOT_MAPPED")
-
-    def _send_via_port(self, port: str, phone: str, message: str, sim_id: Optional[str] = None) -> Dict[str, str]:
-        client = ModemATClient(
+    def _make_client(self, port: str) -> ModemATClient:
+        return ModemATClient(
             port=port,
             serial_timeout=self.serial_timeout,
             command_timeout=self.command_timeout,
         )
-        return client.send_sms(
+
+    def _get_client(self, port: str) -> ModemATClient:
+        """Return the persistent client for this port, initializing if needed."""
+        with self._clients_lock:
+            client = self._clients.get(port)
+        if client is not None:
+            return client
+
+        client = self._make_client(port)
+        client.initialize(global_timeout=20.0)
+
+        with self._clients_lock:
+            if port not in self._clients:
+                self._clients[port] = client
+            else:
+                client.close()
+                client = self._clients[port]
+
+        return client
+
+    def warm_up(self, modems: List[Dict]) -> None:
+        """Pre-open and configure persistent connections for all send ports at startup."""
+        for modem in modems:
+            port = modem.get("port")
+            if not port:
+                continue
+            try:
+                self._get_client(port)
+                logger.info("MODEM_CLIENT_READY port=%s", port)
+            except Exception as exc:
+                logger.warning("MODEM_CLIENT_INIT_FAILED port=%s error=%s", port, exc)
+
+    # ------------------------------------------------------------------
+    # Send
+    # ------------------------------------------------------------------
+
+    def _port_for_sim(self, sim_id: str) -> str:
+        modem = self.registry.get_by_sim_id(sim_id=sim_id)
+        if modem and modem.get("at_ok"):
+            port = modem.get("port")
+            if isinstance(port, str) and port:
+                return port
+        raise SMSExecutionError("SIM_NOT_MAPPED")
+
+    def _send_via_port(self, port: str, phone: str, message: str, sim_id: Optional[str] = None) -> Dict[str, str]:
+        client = self._get_client(port)
+        return client.send_persistent(
             phone=phone,
             message=message,
             global_timeout=self.send_timeout,
@@ -92,7 +131,6 @@ class SmsService:
         started_at = time.monotonic()
 
         try:
-            # STEP 1: resolve port
             port = self._port_for_sim(sim_id)
             modem = self.registry.get_by_sim_id(sim_id)
             modem_id = modem.get("modem_id") if modem else None
@@ -102,7 +140,6 @@ class SmsService:
                 sim_id, modem_id, port, phone,
             )
 
-            # STEP 2: try primary port (if02)
             try:
                 raw_steps = self._send_via_port(port, phone, message, sim_id=sim_id)
                 duration_ms = int((time.monotonic() - started_at) * 1000)
@@ -133,12 +170,12 @@ class SmsService:
                     sim_id, modem_id, port, primary_error.code,
                 )
 
-                # Network/modem errors (CMS/CME) won't be fixed by retrying a
-                # different port — fail immediately so Laravel gets the error fast.
+                # Network/modem errors won't be fixed by retrying — fail fast.
                 if primary_error.cms_code is not None or primary_error.cme_code is not None:
                     raise primary_error
 
-                # STEP 3: retry on same port (hardware errors only)
+                # Hardware error — send_persistent already tried reinit+retry internally.
+                # Give it one final attempt after a short pause.
                 try:
                     time.sleep(0.5)
                     raw_steps = self._send_via_port(port, phone, message, sim_id=sim_id)
@@ -159,45 +196,6 @@ class SmsService:
 
                 except SMSExecutionError:
                     pass
-
-                # STEP 4: failover to if03 (hardware errors only)
-                _modem = self.registry.get_by_sim_id(sim_id)
-                fallback = _modem.get("fallback_port") if _modem else None
-
-                if fallback:
-                    logger.warning(
-                        "FALLBACK ATTEMPT sim_id=%s fallback_port=%s",
-                        sim_id, fallback,
-                    )
-
-                    try:
-                        raw_steps = self._send_via_port(fallback, phone, message, sim_id=sim_id)
-                        logger.info("FALLBACK SUCCESS sim_id=%s port=%s", sim_id, fallback)
-
-                        # update registry so next send uses if03 directly
-                        if _modem:
-                            _modem["port"] = fallback
-
-                        return SendResponse(
-                            success=True,
-                            message_id=message_id,
-                            error=None,
-                            raw={
-                                "sim_id": sim_id,
-                                "modem_id": modem_id,
-                                "port": fallback,
-                                "status": "fallback_success",
-                                "meta": meta,
-                            },
-                        )
-
-                    except SMSExecutionError as fallback_error:
-                        logger.error(
-                            "FALLBACK FAILED sim_id=%s error=%s cms=%s cme=%s",
-                            sim_id, fallback_error.code,
-                            fallback_error.cms_code, fallback_error.cme_code,
-                        )
-                        raise fallback_error
 
                 raise primary_error
 
