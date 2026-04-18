@@ -318,6 +318,9 @@ class ModemATClient:
 
         self._command_expect_ok("ATE0", "AT_NOT_RESPONDING", deadline=deadline)
         self._command_expect_ok("AT+CMGF=1", "CMGF_FAILED", deadline=deadline, retries=1)
+        # Store inbound SMS to SIM (mt=1) instead of pushing +CMT directly.
+        # if03 polls AT+CMGL to pick them up; if02 never reads URCs.
+        self._command_expect_ok("AT+CNMI=2,1,0,0,0", "AT_NOT_RESPONDING", deadline=deadline)
 
         self._initialized = True
         logger.info("MODEM_INITIALIZED port=%s", self.port)
