@@ -147,52 +147,16 @@ class InboundListener(threading.Thread):
         time.sleep(0.5)
         self._ser.reset_input_buffer()
 
-        # Configure modem for text mode + push notifications
+        # Configure modem for text mode (polling — no +CNMI push needed)
         self._cmd("AT")
-        self._cmd("AT+CMGF=1")           # text mode
-        self._cmd("AT+CNMI=2,2,0,0,0")   # push +CMT immediately on receipt
+        self._cmd("AT+CMGF=1")
 
-        # Drain any messages stored on SIM before listener started
-        self._drain_stored()
+        logger.info("INBOUND_LISTENER_READY port=%s sim=%s (polling every 1s)", self._port, self._runtime_sim_id)
 
-        logger.info("INBOUND_LISTENER_READY port=%s sim=%s", self._port, self._runtime_sim_id)
-
-        # Main loop — block waiting for +CMT unsolicited lines
-        buffer = ""
-        pending_cmt_from: Optional[str] = None
-        pending_cmt_time: Optional[str] = None
-
+        # Poll AT+CMGL every 1s — if03 doesn't receive +CMT push notifications
         while not self._stop_event.is_set():
-            try:
-                raw = self._ser.readline()
-            except serial.SerialException as exc:
-                raise RuntimeError(f"serial read error: {exc}") from exc
-
-            if not raw:
-                continue  # timeout — loop to check stop_event
-
-            line = raw.decode("utf-8", errors="ignore").rstrip("\r\n")
-
-            if not line:
-                continue
-
-            # Detect +CMT header
-            parsed = _parse_cmt_header(line)
-            if parsed:
-                pending_cmt_from, pending_cmt_time = parsed
-                continue
-
-            # If we have a pending CMT header, this line is the message body
-            if pending_cmt_from is not None:
-                message_body = line
-                self._handle_inbound(
-                    from_number=pending_cmt_from,
-                    message=message_body,
-                    received_at=_modem_ts_to_iso(pending_cmt_time) if pending_cmt_time else _now_iso(),
-                )
-                pending_cmt_from = None
-                pending_cmt_time = None
-                continue
+            self._drain_stored()
+            self._stop_event.wait(1.0)
 
     # ------------------------------------------------------------------
     # Message handling
