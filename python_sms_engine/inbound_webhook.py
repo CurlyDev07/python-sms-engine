@@ -138,6 +138,7 @@ def deliver_one(
             "INBOUND_DELIVERY_ABANDONED key=%s attempts=%s",
             key, record["attempts"],
         )
+        spool.mark_abandoned(key)
         return False
 
     payload = {

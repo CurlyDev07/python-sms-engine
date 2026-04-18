@@ -102,6 +102,15 @@ class InboundSpool:
             )
             self._conn.commit()
 
+    def mark_abandoned(self, idempotency_key: str) -> None:
+        """Mark a spool record as abandoned so it stops being retried."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE inbound_spool SET status='abandoned' WHERE idempotency_key=?",
+                (idempotency_key,),
+            )
+            self._conn.commit()
+
     def record_attempt(self, idempotency_key: str) -> None:
         """Increment attempt counter and update last_attempt_at timestamp."""
         now = datetime.now(timezone.utc).isoformat()
