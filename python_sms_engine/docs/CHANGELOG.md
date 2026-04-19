@@ -375,6 +375,59 @@ WATCHDOG_RECOVERY_FAILED  — reinit also failed, alert logged
 
 ---
 
+## [2026-04-20] – /modems/health Now Returns Live Watchdog State
+
+### Changed
+
+`/modems/health` previously returned stale data from the startup registry probe — data could be hours old with no indication of current modem state. It now returns live watchdog data, refreshed every 30 seconds.
+
+**Old contract (removed):**
+```json
+{ "sim_id": "...", "modem_id": "...", "port": "...", "reachable": true, "at_ok": true }
+```
+
+**New contract:**
+```json
+{
+  "sim_id": "515039219149367",
+  "modem_id": "866358071697796",
+  "port": "/dev/ttyUSB6",
+  "alive": true,
+  "last_ping_at": "2026-04-19T11:53:04.272070+00:00",
+  "last_ping_ok": true,
+  "consecutive_failures": 0,
+  "send_ready": true
+}
+```
+
+**Field changes:**
+
+| Old | New | Notes |
+|---|---|---|
+| `reachable` | `alive` | Same meaning, now based on live AT ping |
+| `at_ok` | `last_ping_ok` | Same meaning, timestamped |
+| `sim_ready` | removed | Covered by `send_ready` |
+| `creg_registered` | removed | Covered by `send_ready` |
+| `signal` | removed | Not tracked by watchdog |
+| — | `last_ping_at` | ISO8601 timestamp of last ping |
+| — | `consecutive_failures` | Count of consecutive failed pings |
+| `send_ready` | `send_ready` | Unchanged — use this for routing |
+
+**Routing guidance:**
+- `send_ready == true` → safe to route sends to this `sim_id`
+- `consecutive_failures >= 3` → consider alerting operator
+- Data is at most 30s stale (watchdog ping interval)
+- Safe to poll anytime — no hardware interaction, reads from memory only
+
+### Changed
+- `ModemWatchdog` now tracks `_status` dict per port — updated after every ping
+- `ModemWatchdog.get_status()` exposes live state for `/modems/health`
+- `ModemWatchdog.run()` pings immediately at startup — health endpoint populated within seconds, not after first 30s cycle
+- `ModemHealthItem` schema updated — old fields removed, new watchdog fields added
+- `/modems/health` handler reads from `app.state.modem_watchdog.get_status()` directly
+
+---
+
 ## [2026-04-18] – Per-Port Send Lock: Prevents AT Command Injection
 
 ### Fixed
