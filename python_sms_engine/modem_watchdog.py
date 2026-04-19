@@ -43,6 +43,7 @@ class ModemWatchdog(threading.Thread):
 
     def run(self) -> None:
         logger.info("WATCHDOG_STARTED interval=%ss", self._interval)
+        self._ping_all()  # immediate first ping so /modems/health is populated right away
         while not self._stop_event.wait(self._interval):
             self._ping_all()
 
