@@ -26,8 +26,11 @@ class ModemHealthItem(BaseModel):
     sim_id: Optional[str] = None
     modem_id: Optional[str] = None
     port: Optional[str] = None
-    reachable: bool
-    at_ok: bool
+    alive: bool
+    last_ping_at: Optional[str] = None
+    last_ping_ok: bool
+    consecutive_failures: int = 0
+    send_ready: bool
 
 
 class ModemsHealthResponse(BaseModel):

@@ -11,7 +11,7 @@ from inbound_webhook import InboundRetryWorker
 from modem_manager import ModemManager
 from modem_registry import ModemRegistry
 from modem_watchdog import ModemWatchdog
-from schemas import HealthResponse, ModemsDiscoverResponse, ModemsHealthResponse, SendRequest, SendResponse
+from schemas import HealthResponse, ModemsDiscoverResponse, ModemsHealthResponse, ModemHealthItem, SendRequest, SendResponse
 from sms_service import SmsService
 
 logging.basicConfig(
@@ -156,8 +156,9 @@ def health() -> HealthResponse:
 
 @app.get("/modems/health", response_model=ModemsHealthResponse, dependencies=[Depends(_require_token)])
 def modems_health() -> ModemsHealthResponse:
-    manager: ModemManager = app.state.modem_manager
-    return ModemsHealthResponse(success=True, modems=manager.health())
+    watchdog = app.state.modem_watchdog
+    items = [ModemHealthItem(**entry) for entry in watchdog.get_status()]
+    return ModemsHealthResponse(success=True, modems=items)
 
 
 @app.get("/modems/discover", response_model=ModemsDiscoverResponse, dependencies=[Depends(_require_token)])
