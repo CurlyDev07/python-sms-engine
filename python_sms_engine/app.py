@@ -166,7 +166,14 @@ def discover_modems() -> ModemsDiscoverResponse:
     Forces a full hardware rescan. Closes persistent connections first so probes
     get exclusive port access — prevents AT command injection into active sends.
     Reopens persistent connections after probing completes.
+    Set DISCOVER_ENABLED=false in .env to disable without touching code.
     """
+    import os
+    if os.environ.get("DISCOVER_ENABLED", "true").lower() in ("false", "0", "no"):
+        logger.info("DISCOVER_DISABLED — returning cached registry state")
+        registry: ModemRegistry = app.state.modem_registry
+        return ModemsDiscoverResponse(success=True, modems=list(registry._cache.values()))
+
     registry: ModemRegistry = app.state.modem_registry
     service: SmsService = app.state.sms_service
     try:
