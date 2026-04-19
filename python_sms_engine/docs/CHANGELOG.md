@@ -315,6 +315,66 @@ IDENTIFIER_RECOVERED_FROM_CACHE — last_good_imsi restored after probe returned
 
 ---
 
+## [2026-04-19] – Modem Stability: Watchdog + USB Autosuspend Fix + AT Injection Fix
+
+### Fixed
+
+#### AT Command Injection into SMS Body
+- **Root cause:** `/modems/discover` was being called automatically every ~60 seconds by Laravel. Each call opened a second file descriptor on if02 (the persistent connection port) without acquiring the port lock. If a send was in progress, the probe's `AT+CPIN?` and `AT+CREG?` bytes landed inside the open `AT+CMGS` body window — the modem treated them as SMS body text. Recipients received messages like `Hello AT+CPIN?AT+CREG?`.
+- **Fix 1 — Port lock in probe:** `modem_detector._probe_port()` now acquires `get_port_lock(port)` before opening if02. Probe and send can never overlap.
+- **Fix 2 — Close before probe:** `/modems/discover` endpoint now calls `service.close_all_clients()` before probing and `service.warm_up()` after. Eliminates double file descriptor entirely.
+- **Fix 3 — DISCOVER_ENABLED flag:** Added `DISCOVER_ENABLED=false` env var to disable live probing without code changes. When disabled, returns cached registry state instantly. Used to stop the automatic discover calls from Laravel while root cause was investigated.
+
+#### Inbound SMS Not Detected on if03
+- **Root cause:** `AT+CNMI=2,2,0,0,0` (push mode) only delivers `+CMT` unsolicited notifications to if02 (primary port). if03 (secondary port) never receives them — the listener was READY but deaf.
+- **Fix 1 — Switch to polling:** Removed `+CMT` wait loop from `InboundListener`. Now polls `AT+CMGL="ALL"` every 1 second on if03. Messages detected within ~1s of arrival.
+- **Fix 2 — Store to SIM:** Added `AT+CNMI=2,1,0,0,0` to `initialize()` on if02. `mt=1` stores inbound SMS to SIM instead of pushing directly as `+CMT`. if03 polling finds them via `AT+CMGL`.
+
+#### Abandoned Spool Records Logging Forever
+- **Root cause:** `deliver_one()` returned `False` when `attempts >= max_attempts` but never updated the spool status. `get_pending()` kept returning the same records, so `INBOUND_DELIVERY_ABANDONED` was logged every 30s indefinitely.
+- **Fix:** Added `InboundSpool.mark_abandoned()`. `deliver_one()` now calls it when max attempts reached — record status set to `abandoned`, excluded from future `get_pending()` results.
+
+### Added
+
+#### Modem Watchdog (`modem_watchdog.py`)
+- New `ModemWatchdog` background thread, started at startup after `warm_up()`
+- Pings each persistent connection with `AT` every 30 seconds
+- Acquires port lock before pinging — never races with active sends
+- On ping failure: closes and reinitializes the persistent connection automatically
+- On reinit failure: logs `WATCHDOG_RECOVERY_FAILED` alert — send will attempt lazy reinit
+- Skips ports where lock is busy after 5s timeout (defers to next 30s cycle)
+
+```
+New log events:
+WATCHDOG_STARTED          — watchdog thread launched, interval logged
+WATCHDOG_PING_ALL         — each cycle: modem count + known ports
+WATCHDOG_OK               — AT ping succeeded for port/sim
+WATCHDOG_SKIP             — port lock busy, deferred to next cycle
+WATCHDOG_FAIL             — AT ping failed, reinit triggered
+WATCHDOG_RECOVERED        — reinit succeeded after failure
+WATCHDOG_RECOVERY_FAILED  — reinit also failed, alert logged
+```
+
+#### USB Autosuspend Disabled (Server Config)
+- Linux was suspending Quectel EC25 modems after 2 seconds of inactivity — modems silently disappeared from `/dev/ttyUSBx`
+- Added udev rule: `/etc/udev/rules.d/99-quectel.rules`
+  ```
+  ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2c7c", ATTR{power/autosuspend}="-1"
+  ```
+- Also applied immediately via sysfs (no reboot required)
+- All 3 Quectel modems now show `autosuspend=-1` permanently
+
+### Verified Live (2026-04-19)
+- All 3 modems (`ttyUSB2`, `ttyUSB6`, `ttyUSB10`) showing `WATCHDOG_OK` every 30s
+- Inbound SMS received → spooled → delivered to Laravel in ~100ms
+- No `MODEM_CLIENTS_CLOSED_FOR_PROBE` interference with sends
+
+### Known Issues
+- `/modems/discover` disabled (`DISCOVER_ENABLED=false`) — Laravel is calling it automatically every ~60s which causes persistent connections to close and reopen. Root cause on Laravel side needs investigation and the scheduler/cron calling discover should be identified and stopped or changed to use `/modems/health` instead.
+- Inbound SMS → Chat App UI not yet appearing. Python → Laravel webhook confirmed working (`ok:true`). Suspected issue: Laravel's relay/broadcast queue (`queued_for_relay:true`) is not being processed.
+
+---
+
 ## [2026-04-18] – Per-Port Send Lock: Prevents AT Command Injection
 
 ### Fixed
