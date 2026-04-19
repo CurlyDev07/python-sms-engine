@@ -10,6 +10,7 @@ from inbound_spool import InboundSpool
 from inbound_webhook import InboundRetryWorker
 from modem_manager import ModemManager
 from modem_registry import ModemRegistry
+from modem_watchdog import ModemWatchdog
 from schemas import HealthResponse, ModemsDiscoverResponse, ModemsHealthResponse, SendRequest, SendResponse
 from sms_service import SmsService
 
@@ -130,6 +131,11 @@ def startup_event() -> None:
     service: SmsService = app.state.sms_service
     service.warm_up(registry.get_all())
     logger.info("MODEM_CLIENTS_WARMED_UP")
+
+    watchdog = ModemWatchdog(service=service, registry=registry, interval=30.0)
+    watchdog.start()
+    app.state.modem_watchdog = watchdog
+    logger.info("MODEM_WATCHDOG_STARTED")
 
 
 @app.post("/send", response_model=SendResponse, dependencies=[Depends(_require_token)])
