@@ -38,6 +38,7 @@ class ModemWatchdog(threading.Thread):
 
     def _ping_all(self) -> None:
         modems = self._registry.get_all()
+        logger.info("WATCHDOG_PING_ALL modem_count=%s known_ports=%s", len(modems), list(self._service._clients.keys()))
         for modem in modems:
             port = modem.get("port")
             sim_id = modem.get("sim_id")
@@ -50,6 +51,7 @@ class ModemWatchdog(threading.Thread):
             client = self._service._clients.get(port)
 
         if client is None:
+            logger.warning("WATCHDOG_NO_CLIENT port=%s sim_id=%s — skipping", port, sim_id)
             return  # not warmed up yet — skip
 
         port_lock = get_port_lock(port)
