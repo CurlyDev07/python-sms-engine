@@ -96,6 +96,18 @@ class SmsService:
             except Exception as exc:
                 logger.warning("MODEM_CLIENT_INIT_FAILED port=%s error=%s", port, exc)
 
+    def close_all_clients(self) -> None:
+        """Close all persistent connections so modem probes get exclusive port access."""
+        with self._clients_lock:
+            for port, client in list(self._clients.items()):
+                try:
+                    client._initialized = False
+                    client.close()
+                except Exception:
+                    pass
+            self._clients.clear()
+        logger.info("MODEM_CLIENTS_CLOSED_FOR_PROBE")
+
     # ------------------------------------------------------------------
     # Send
     # ------------------------------------------------------------------

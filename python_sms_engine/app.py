@@ -157,18 +157,23 @@ def modems_health() -> ModemsHealthResponse:
 @app.get("/modems/discover", response_model=ModemsDiscoverResponse, dependencies=[Depends(_require_token)])
 def discover_modems() -> ModemsDiscoverResponse:
     """
-    Forces a full hardware rescan. Probes all modems in parallel with a hard
-    per-modem timeout so one stuck port never hangs the whole response.
-    Returns ALL detected ports, including unhealthy/timed-out ones with
-    probe_error set.
+    Forces a full hardware rescan. Closes persistent connections first so probes
+    get exclusive port access — prevents AT command injection into active sends.
+    Reopens persistent connections after probing completes.
     """
+    registry: ModemRegistry = app.state.modem_registry
+    service: SmsService = app.state.sms_service
     try:
-        registry: ModemRegistry = app.state.modem_registry
+        service.close_all_clients()
+        logger.info("DISCOVER_CLIENTS_CLOSED")
         modems = registry.discover()
         return ModemsDiscoverResponse(success=True, modems=modems)
     except Exception:
         logger.exception("MODEM_DISCOVERY_FAILED")
         return ModemsDiscoverResponse(success=False, modems=[])
+    finally:
+        service.warm_up(registry.get_all())
+        logger.info("DISCOVER_CLIENTS_REOPENED")
 
 
 @app.get("/modems/summary", dependencies=[Depends(_require_token)])

@@ -5,7 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from typing import Dict, List, Optional, Tuple
 
-from at_client import ModemATClient
+from at_client import ModemATClient, get_port_lock
 
 QUECTEL_VENDOR_ID = "2c7c"
 
@@ -148,6 +148,8 @@ def _probe_port(port: str, serial_timeout: float, command_timeout: float) -> Dic
     }
 
     opened = False
+    port_lock = get_port_lock(port)
+    lock_held = port_lock.acquire(timeout=15.0)
     try:
         client.open()
         opened = True
@@ -200,6 +202,8 @@ def _probe_port(port: str, serial_timeout: float, command_timeout: float) -> Dic
     finally:
         if opened:
             client.close()
+        if lock_held:
+            port_lock.release()
 
 
 def _safe_probe(
