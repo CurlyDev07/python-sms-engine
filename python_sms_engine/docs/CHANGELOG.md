@@ -428,6 +428,35 @@ WATCHDOG_RECOVERY_FAILED  — reinit also failed, alert logged
 
 ---
 
+## [2026-04-20] – Send Rate Tuning: 4s Floor via serial_timeout=2
+
+### Changed
+
+`SMS_ENGINE_SERIAL_TIMEOUT` raised from `0.2` to `2` to enforce a minimum send duration of ~4 seconds per message. This acts as a carrier rate-limit guard — sending too fast risks rejection or silent drops by the carrier.
+
+**How it works:** Each `ser.read(256)` call blocks for up to `serial_timeout` seconds waiting for modem data. A send involves two reads (cmgs_prompt + final_wait). With `serial_timeout=2`, each phase takes ~2s, giving a consistent ~4s total regardless of carrier response speed.
+
+**Observed timings (`SEND_TIMING` logs):**
+```
+cmgs_prompt_ms=2001  final_wait_ms=2001  total_ms=4003
+```
+
+**Tradeoff:** Slower than the 800ms–1.2s achieved with `serial_timeout=0.2`, but more conservative toward carriers. The right value depends on carrier behavior and send volume.
+
+### Configuration
+
+```
+SMS_ENGINE_SERIAL_TIMEOUT=2   ← raised from 0.2
+```
+
+| Value | send floor | When to use |
+|---|---|---|
+| `0.2` | ~800ms–1.2s | High-throughput, carrier allows fast sends |
+| `0.5` | ~1.5s–2s | Moderate pacing |
+| `2` | ~4s | Conservative — carrier rate-limit safety |
+
+---
+
 ## [2026-04-18] – Per-Port Send Lock: Prevents AT Command Injection
 
 ### Fixed
